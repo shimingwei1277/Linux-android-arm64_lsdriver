@@ -311,8 +311,93 @@ static inline int _internal_write_fast_linear(phys_addr_t paddr, void *buffer, s
     return 0;
 }
 
+// 手动走页表翻译（不再禁止中断，靠每级安全检查防护）
+static inline int manual_va_to_pa_arm_fast(struct mm_struct *mm, uint64_t vaddr, phys_addr_t *paddr)
+{
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *ptep, pte;
+    unsigned long pfn;
+
+    if (unlikely(!mm || !paddr))
+        return -1;
+
+    // PGD Level
+    pgd = pgd_offset(mm, vaddr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd))
+        return -1;
+
+    // P4D Level
+    p4d = p4d_offset(pgd, vaddr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d))
+        return -1;
+
+    // PUD Level (可能遇到 1GB 大页)
+    pud = pud_offset(p4d, vaddr);
+    if (pud_none(*pud))
+        return -1;
+
+    // 检查是否是 1G 大页
+    if (pud_leaf(*pud))
+    {
+        // 检查pfn
+        pfn = pud_pfn(*pud);
+        if (unlikely(!pfn_valid(pfn)))
+            return -1;
+
+        *paddr = (pud_pfn(*pud) << PAGE_SHIFT) + (vaddr & ~PUD_MASK);
+        return 0;
+    }
+    if (pud_bad(*pud))
+        return -1;
+
+    //  PMD Level (可能遇到 2MB 大页)
+    pmd = pmd_offset(pud, vaddr);
+    if (pmd_none(*pmd))
+        return -1;
+
+    // 检查是否是 2M 大页
+    if (pmd_leaf(*pmd))
+    {
+        // 检查pfn
+        pfn = pmd_pfn(*pmd);
+        if (unlikely(!pfn_valid(pfn)))
+            return -1;
+
+        *paddr = (pmd_pfn(*pmd) << PAGE_SHIFT) + (vaddr & ~PMD_MASK);
+        return 0;
+    }
+    if (pmd_bad(*pmd))
+        return -1;
+
+    //  PTE Level (普通的 4KB 页)
+    ptep = pte_offset_map(pmd, vaddr);
+    if (unlikely(!ptep))
+        return -1;
+
+    pte = *ptep;     // 原子读取 PTE 内容到栈上
+    pte_unmap(ptep); // 立即释放映射
+
+    // 必须检查 pte_present，因为页可能被换出到 Swap 分区
+    // 如果 present 为 false，pfn 字段是无效的（存的是 swap offset）
+    if (pte_present(pte))
+    {
+        // 检查pfn
+        pfn = pte_pfn(pte);
+        if (unlikely(!pfn_valid(pfn)))
+            return -1;
+
+        *paddr = (pte_pfn(pte) << PAGE_SHIFT) + (vaddr & ~PAGE_MASK);
+        return 0;
+    }
+
+    return -1;
+}
+
 // 硬件mmu翻译
-int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_addr_t *pa)
+static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_addr_t *pa)
 {
     u64 pgd_phys;
     int ret;
@@ -331,7 +416,7 @@ int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_addr_t *pa)
         "mrs    %[tmp_daif], daif\n"
         "msr    daifset, #2\n"
 
-        // 替换目标进程页表
+        // 临时把 ttbr0_el1 改为pgd_phys，为了后续at指令翻译需要的页表基址
         "mrs    %[tmp_ttbr], ttbr0_el1\n"
         "msr    ttbr0_el1, %[pgd_phys]\n"
         "isb\n"
@@ -380,7 +465,7 @@ int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_addr_t *pa)
         // Clobber
         : "cc", "memory");
 
-    // 把写入内存的工作交回给 C 语言，编译器会生成最优的 str 指令
+    // 把写入内存的工作交回给 C 语言，编译器会生成最优的指令
     if (ret == 0)
     {
         *pa = phys_out;
@@ -613,7 +698,7 @@ Modifier's View :
 [6] -> 7602780000 (第三个 rw-p)
 [7] -> 7602784000 (第四个 rw-p)
 规则如下：
-优先级分组 (Priority Grouping): 将所有内存段按权限分为三组，并按固定的优先级顺序排列它们。
+优先级分组: 将所有内存段按权限分为三组，并按固定的优先级顺序排列它们。
 最高优先级: r-xp (可执行)
 中等优先级: r--p (只读)
 最低优先级: rw-p (可读写)

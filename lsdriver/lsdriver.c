@@ -46,8 +46,8 @@ struct req_obj
 	atomic_t kernel; // 由用户模式设置 1 = 内核有待处理的请求, 0 = 请求已完成
 	atomic_t user;	 // 由内核模式设置 1 = 用户模式有待处理的请求, 0 = 请求已完成
 
-	enum sm_req_op op;	 // shared memory请求操作类型
-	int status; // 操作状态
+	enum sm_req_op op; // shared memory请求操作类型
+	int status;		   // 操作状态
 
 	// 内存读取
 	int pid;
@@ -58,8 +58,8 @@ struct req_obj
 	// 进程内存信息
 	struct memory_info mem_info;
 
-	enum bp_type bt;				  // 断点类型
-	enum bp_scope bs;			  // 断点作用线程范围
+	enum bp_type bt;		  // 断点类型
+	enum bp_scope bs;		  // 断点作用线程范围
 	int len_bytes;			  // 断点长度字节
 	struct hwbp_info bp_info; // 断点信息
 

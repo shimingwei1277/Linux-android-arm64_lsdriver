@@ -204,6 +204,7 @@ namespace Types
         Changed,
         Unchanged,
         Range,
+        Pointer,
         Count
     };
 
@@ -231,7 +232,7 @@ namespace Types
     namespace Labels
     {
         constexpr std::array TYPE = {"Int8", "Int16", "Int32", "Int64", "Float", "Double"};
-        constexpr std::array FUZZY = {"未知", "等于", "大于", "小于", "增加", "减少", "改变", "不变", "范围"};
+        constexpr std::array FUZZY = {"未知", "等于", "大于", "小于", "增加", "减少", "改变", "不变", "范围", "指针"};
         constexpr std::array FORMAT = {"HexDump", "Hex64", "I8", "I16", "I32", "I64", "Float", "Double", "Disasm"};
     }
 
@@ -268,7 +269,8 @@ namespace MemUtils
     // 验证地址合法性，指针和地址才需要验证，值不需要
     constexpr bool IsValidAddr(uintptr_t addr) noexcept
     {
-        return addr > Constants::ADDR_MIN && addr < Constants::ADDR_MAX;
+        uintptr_t a = Normalize(addr);
+        return a > Constants::ADDR_MIN && a < Constants::ADDR_MAX;
     }
 
     // 辅助分发
@@ -297,6 +299,7 @@ namespace MemUtils
     // 读取并格式化为字符串
     inline std::string ReadAsString(uintptr_t addr, DataType type)
     {
+        addr = Normalize(addr);
         if (!addr)
             return "??";
         return DispatchType(type, [&]<typename T>() -> std::string
@@ -312,6 +315,7 @@ namespace MemUtils
     // 字符串解析写入
     inline bool WriteFromString(uintptr_t addr, DataType type, std::string_view str)
     {
+        addr = Normalize(addr);
         if (!addr || str.empty())
             return false;
         try
@@ -327,6 +331,34 @@ namespace MemUtils
                 return dr.Write<T>(addr, static_cast<T>(std::stoi(s)));
             else
                 return dr.Write<T>(addr, static_cast<T>(std::stoll(s))); });
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    // 指针模式下读取地址处的int64，以Hex显示
+    inline std::string ReadAsPointerString(uintptr_t addr)
+    {
+        addr = Normalize(addr);
+        if (!addr)
+            return "??";
+        int64_t raw = dr.Read<int64_t>(addr);
+        uintptr_t normalized = Normalize(static_cast<uintptr_t>(raw));
+        return std::format("{:X}", normalized);
+    }
+    // 指针模式将Hex字符串解析为地址写入int64
+    inline bool WritePointerFromString(uintptr_t addr, std::string_view str)
+    {
+        addr = Normalize(addr);
+        if (!addr || str.empty())
+            return false;
+        try
+        {
+            std::string s(str);
+            uintptr_t val = std::strtoull(s.c_str(), nullptr, 16);
+            return dr.Write<int64_t>(addr, static_cast<int64_t>(val));
         }
         catch (...)
         {
@@ -364,6 +396,12 @@ namespace MemUtils
                     std::swap(lo, hi);
                 return value >= lo && value <= hi;
             }
+            case FuzzyMode::Pointer:
+            {
+                uintptr_t normalizedValue = Normalize(static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(value)));
+                uintptr_t normalizedTarget = Normalize(static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(target)));
+                return normalizedValue == normalizedTarget;
+            }
             default:
                 return false;
             }
@@ -396,6 +434,8 @@ namespace MemUtils
                     std::swap(lo, hi); // 自动纠正反向输入
                 return v >= lo - eps && v <= hi + eps;
             }
+            case FuzzyMode::Pointer:
+                return false; // 浮点类型不支持指针模式
             default:
                 return false;
             }
@@ -590,40 +630,51 @@ private:
         {
             futs.push_back(Utils::GlobalPool.push([&, t, rmx]
                                                   {
-            size_t end = std::min(t * chunk + chunk, regions.size());
-            tR[t].reserve(100000);
-            tV[t].reserve(100000);
-            std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
+        size_t end = std::min(t * chunk + chunk, regions.size());
+        tR[t].reserve(100000);
+        tV[t].reserve(100000);
+        std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
 
-            for (size_t i = t * chunk; i < end && Config::g_Running; ++i) {
-                auto [rStart, rEnd] = regions[i];
-                if (rEnd - rStart < sizeof(T)) continue;
+        for (size_t i = t * chunk; i < end && Config::g_Running; ++i) {
+            auto [rStart, rEnd] = regions[i];
+            if (rEnd - rStart < sizeof(T)) continue;
 
-                for (uintptr_t addr = rStart; addr < rEnd; addr += Config::Constants::SCAN_BUFFER) {
-                    size_t sz = std::min(static_cast<size_t>(rEnd - addr),
-                                         Config::Constants::SCAN_BUFFER);
-                    if (dr.Read(addr, buf.data(), sz) != 0) continue;
+            for (uintptr_t addr = rStart; addr < rEnd; addr += Config::Constants::SCAN_BUFFER) {
+                size_t sz = std::min(static_cast<size_t>(rEnd - addr),
+                                     Config::Constants::SCAN_BUFFER);
+                if (dr.Read(addr, buf.data(), sz) != 0) continue;
 
-                    for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T)) {
-                        T value;
-                        std::memcpy(&value, buf.data() + off, sizeof(T));
-                        if (mode == Types::FuzzyMode::Unknown ||
-                            MemUtils::Compare(value, target, mode, 0, rmx)) {
-                            tR[t].push_back(addr + off);
+                for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T)) {
+                    T value;
+                    std::memcpy(&value, buf.data() + off, sizeof(T));
+                    if (mode == Types::FuzzyMode::Unknown ||
+                        MemUtils::Compare(value, target, mode, 0, rmx)) {
+                        tR[t].push_back(MemUtils::Normalize(addr + off));
+                        
+                        // 指针模式存储归一化后的值（只对整数类型有效）
+                        if constexpr (std::is_integral_v<T>) {
+                            if (mode == Types::FuzzyMode::Pointer) {
+                                uintptr_t normalizedVal = MemUtils::Normalize(
+                                    static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(value)));
+                                tV[t].push_back(static_cast<double>(normalizedVal));
+                            } else {
+                                tV[t].push_back(static_cast<double>(value));
+                            }
+                        } else {
                             tV[t].push_back(static_cast<double>(value));
                         }
                     }
                 }
-                if ((done.fetch_add(1) & 0x7F) == 0)
-                    progress_ = static_cast<float>(done) / regions.size();
-            } }));
+            }
+            if ((done.fetch_add(1) & 0x7F) == 0)
+                progress_ = static_cast<float>(done) / regions.size();
+        } }));
         }
 
         for (auto &f : futs)
             f.get();
         mergeResults(tR, tV, tc);
     }
-
     template <typename T>
     void scanNext(T target, Types::FuzzyMode mode)
     {
@@ -651,44 +702,55 @@ private:
         {
             futures.push_back(Utils::GlobalPool.push([&, t, rangeMax]
                                                      {
-            size_t start = t * chunk;
-            size_t end = std::min(start + chunk, total);
-            if (start >= end) return;
-            threadResults[t].reserve((end - start) / 3);
-            threadValues[t].reserve((end - start) / 3);
-            std::vector<uint8_t> buffer;
+        size_t start = t * chunk;
+        size_t end = std::min(start + chunk, total);
+        if (start >= end) return;
+        threadResults[t].reserve((end - start) / 3);
+        threadValues[t].reserve((end - start) / 3);
+        std::vector<uint8_t> buffer;
 
-            for (size_t i = start; i < end && Config::g_Running;) {
-                uintptr_t batchStart = oldResults[i];
-                size_t j = i + 1;
-                while (j < end
-                    && oldResults[j] - oldResults[j-1] <= Config::Constants::MAX_READ_GAP
-                    && oldResults[j] - batchStart + sizeof(T) <= Config::Constants::BATCH_SIZE)
-                    ++j;
+        for (size_t i = start; i < end && Config::g_Running;) {
+            uintptr_t batchStart = oldResults[i];
+            size_t j = i + 1;
+            while (j < end
+                && oldResults[j] - oldResults[j-1] <= Config::Constants::MAX_READ_GAP
+                && oldResults[j] - batchStart + sizeof(T) <= Config::Constants::BATCH_SIZE)
+                ++j;
 
-                size_t bytes = (oldResults[j-1] - batchStart) + sizeof(T);
-                buffer.resize(bytes);
-                if (dr.Read(batchStart, buffer.data(), bytes) == 0) {
-                    for (size_t k = i; k < j; ++k) {
-                        T value = *reinterpret_cast<T*>(buffer.data() + (oldResults[k] - batchStart));
-                        if (MemUtils::Compare(value, target, mode, oldValues[k], rangeMax)) {
-                            threadResults[t].push_back(oldResults[k]);
+            size_t bytes = (oldResults[j-1] - batchStart) + sizeof(T);
+            buffer.resize(bytes);
+            if (dr.Read(batchStart, buffer.data(), bytes) == 0) {
+                for (size_t k = i; k < j; ++k) {
+                    T value = *reinterpret_cast<T*>(buffer.data() + (oldResults[k] - batchStart));
+                    if (MemUtils::Compare(value, target, mode, oldValues[k], rangeMax)) {
+                        threadResults[t].push_back(oldResults[k]);
+                        
+                        // 指针模式存储归一化后的值（只对整数类型有效）
+                        if constexpr (std::is_integral_v<T>) {
+                            if (mode == Types::FuzzyMode::Pointer) {
+                                uintptr_t normalizedVal = MemUtils::Normalize(
+                                    static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(value)));
+                                threadValues[t].push_back(static_cast<double>(normalizedVal));
+                            } else {
+                                threadValues[t].push_back(static_cast<double>(value));
+                            }
+                        } else {
                             threadValues[t].push_back(static_cast<double>(value));
                         }
                     }
                 }
-                done += (j - i);
-                i = j;
-                if (t == 0)
-                    progress_ = static_cast<float>(done) / total;
-            } }));
+            }
+            done += (j - i);
+            i = j;
+            if (t == 0)
+                progress_ = static_cast<float>(done) / total;
+        } }));
         }
 
         for (auto &f : futures)
             f.get();
         mergeResults(threadResults, threadValues, threadCount);
     }
-
     void mergeResults(std::vector<Results> &threadResults, std::vector<Values> &threadValues, unsigned threadCount)
     {
         size_t total = 0;
@@ -884,7 +946,7 @@ private:
             if (static_cast<size_t>(lo) >= regions_.size() || vals[i] < regions_[lo].first)
                 continue;
 
-            d.address = start + i * sizeof(uintptr_t);
+            d.address = MemUtils::Normalize(start + i * sizeof(uintptr_t));
             d.value = vals[i];
             fwrite(&d, sizeof(d), 1, out);
         }
@@ -918,6 +980,7 @@ private:
 
         for (auto &pd : pointers_)
         {
+
             uintptr_t v = MemUtils::Normalize(pd.value);
             if ((v - min_addr) > sub)
                 continue;
@@ -958,6 +1021,10 @@ private:
 
             for (int si = 0; si < mod.seg_count; ++si)
             {
+
+                uintptr_t segStart = MemUtils::Normalize(mod.segs[si].start);
+                uintptr_t segEnd = MemUtils::Normalize(mod.segs[si].end);
+
                 PtrRange pr;
                 pr.level = level;
                 pr.moduleIdx = mi;
@@ -966,10 +1033,11 @@ private:
                 pr.isArray = false;
                 for (auto *p : curr)
                 {
-                    if (p->address >= mod.segs[si].start && p->address < mod.segs[si].end)
+                    uintptr_t addr = MemUtils::Normalize(p->address);
+                    if (addr >= segStart && addr < segEnd)
                     {
                         if (matched.insert(p).second)
-                            pr.results.emplace_back(MemUtils::Normalize(p->address), MemUtils::Normalize(p->value), 0u, 1u);
+                            pr.results.emplace_back(addr, MemUtils::Normalize(p->value), 0u, 1u);
                     }
                 }
                 if (!pr.results.empty())
@@ -1001,7 +1069,12 @@ private:
                 continue;
 
             for (int si = 0; si < mod.seg_count; ++si)
-                flatSegs.push_back({mod.segs[si].start, mod.segs[si].end, mi, si});
+            {
+
+                flatSegs.push_back({MemUtils::Normalize(mod.segs[si].start),
+                                    MemUtils::Normalize(mod.segs[si].end),
+                                    mi, si});
+            }
         }
         std::sort(flatSegs.begin(), flatSegs.end(), [](const auto &a, const auto &b)
                   { return a.start < b.start; });
@@ -1010,12 +1083,13 @@ private:
 
         for (auto *p : curr)
         {
-            auto it = std::upper_bound(flatSegs.begin(), flatSegs.end(), p->address, [](uintptr_t a, const FlatSeg &b)
+            uintptr_t addr = MemUtils::Normalize(p->address);
+            auto it = std::upper_bound(flatSegs.begin(), flatSegs.end(), addr, [](uintptr_t a, const FlatSeg &b)
                                        { return a < b.start; });
             if (it != flatSegs.begin())
             {
                 auto prev = std::prev(it);
-                if (p->address >= prev->start && p->address < prev->end)
+                if (addr >= prev->start && addr < prev->end)
                 {
                     if (matched.insert(p).second)
                     {
@@ -1028,7 +1102,7 @@ private:
                             pr.isManual = false;
                             pr.isArray = false;
                         }
-                        pr.results.emplace_back(MemUtils::Normalize(p->address), MemUtils::Normalize(p->value), 0u, 1u);
+                        pr.results.emplace_back(addr, MemUtils::Normalize(p->value), 0u, 1u);
                     }
                 }
             }
@@ -1039,17 +1113,18 @@ private:
 
         if (scanMode == BaseMode::Manual && manualBase)
         {
+            uintptr_t normManualBase = MemUtils::Normalize(manualBase);
             PtrRange pr;
             pr.level = level;
             pr.moduleIdx = -1;
             pr.segIdx = -1;
             pr.isManual = true;
             pr.isArray = false;
-            pr.manualBase = manualBase;
+            pr.manualBase = normManualBase;
             for (auto *p : curr)
             {
                 uintptr_t addr = MemUtils::Normalize(p->address);
-                if (addr >= manualBase && (addr - manualBase) <= manualMaxOffset)
+                if (addr >= normManualBase && (addr - normManualBase) <= manualMaxOffset)
                 {
                     if (matched.insert(p).second)
                         pr.results.emplace_back(addr, MemUtils::Normalize(p->value), 0u, 1u);
@@ -1063,13 +1138,14 @@ private:
         {
             for (const auto &[idx, objAddr] : arrayEntries)
             {
+
                 PtrRange pr;
                 pr.level = level;
                 pr.moduleIdx = -1;
                 pr.segIdx = -1;
                 pr.isManual = false;
                 pr.isArray = true;
-                pr.arrayBase = arrayBase;
+                pr.arrayBase = MemUtils::Normalize(arrayBase);
                 pr.arrayIndex = idx;
                 for (auto *p : curr)
                 {
@@ -1103,11 +1179,12 @@ private:
         for (size_t i = 0; i < count; i++)
         {
             int lo, hi;
+            uintptr_t normVal = MemUtils::Normalize(start[i].value);
             bin_search(prev, [](auto &x, auto t)
-                       { return x.address < t; }, MemUtils::Normalize(start[i].value), sz, lo, hi);
+                       { return x.address < t; }, normVal, sz, lo, hi);
             start[i].start = lo;
             bin_search(prev, [](auto &x, auto t)
-                       { return x.address <= t; }, MemUtils::Normalize(start[i].value) + offset, sz, lo, hi);
+                       { return x.address <= t; }, normVal + offset, sz, lo, hi);
             start[i].end = lo;
         }
     }
@@ -1228,10 +1305,10 @@ private:
         hdr.module_count = static_cast<int>(ranges.size());
         hdr.level = static_cast<int>(contents.size()) - 1;
         hdr.scanBaseMode = static_cast<uint8_t>(scanMode);
-        hdr.scanManualBase = manualBase;
-        hdr.scanArrayBase = arrayBase;
+        hdr.scanManualBase = MemUtils::Normalize(manualBase);
+        hdr.scanArrayBase = MemUtils::Normalize(arrayBase);
         hdr.scanArrayCount = arrayCount;
-        hdr.scanTarget = target;
+        hdr.scanTarget = MemUtils::Normalize(target);
         fwrite(&hdr, sizeof(hdr), 1, f);
 
         for (auto &r : ranges)
@@ -1240,8 +1317,8 @@ private:
             if (r.isManual)
             {
                 sym.sourceMode = 1;
-                sym.manualBase = r.manualBase;
-                sym.start = r.manualBase;
+                sym.manualBase = MemUtils::Normalize(r.manualBase);
+                sym.start = sym.manualBase;
                 strncpy(sym.name, "manual", sizeof(sym.name) - 1);
                 sym.segment = 0;
                 sym.isBss = false;
@@ -1249,10 +1326,11 @@ private:
             else if (r.isArray)
             {
                 sym.sourceMode = 2;
-                sym.arrayBase = r.arrayBase;
+                sym.arrayBase = MemUtils::Normalize(r.arrayBase);
                 sym.arrayIndex = r.arrayIndex;
+
                 uintptr_t objAddr = 0;
-                dr.Read(r.arrayBase + r.arrayIndex * sizeof(uintptr_t), &objAddr, sizeof(objAddr));
+                dr.Read(MemUtils::Normalize(r.arrayBase) + r.arrayIndex * sizeof(uintptr_t), &objAddr, sizeof(objAddr));
                 sym.start = MemUtils::Normalize(objAddr);
                 char arrName[128];
                 snprintf(arrName, sizeof(arrName), "array[%zu]", r.arrayIndex);
@@ -1264,7 +1342,8 @@ private:
             {
                 const auto &mod = memInfo.modules[r.moduleIdx];
                 const auto &seg = mod.segs[r.segIdx];
-                sym.start = seg.start;
+
+                sym.start = MemUtils::Normalize(seg.start);
                 sym.segment = seg.index;
                 sym.isBss = (seg.index == -1);
 
@@ -1383,10 +1462,20 @@ public:
         scanProgress_ = 0.0f;
         chainCount_ = 0;
 
+        target = MemUtils::Normalize(target);
+        manualBase = MemUtils::Normalize(manualBase);
+        arrayBase = MemUtils::Normalize(arrayBase);
+
         std::println("=== 开始指针扫描 ===");
         std::println("目标: {:x}, 深度: {}, 偏移: {}", target, depth, maxOffset);
 
         regions_ = dr.GetScanRegions();
+
+        for (auto &[rstart, rend] : regions_)
+        {
+            rstart = MemUtils::Normalize(rstart);
+            rend = MemUtils::Normalize(rend);
+        }
         std::sort(regions_.begin(), regions_.end());
 
         if (CollectPointers() == 0 || pointers_.empty())
@@ -1416,6 +1505,7 @@ public:
             for (size_t i = 0; i < arrayCount; i++)
             {
                 uintptr_t ptr = 0;
+
                 if (dr.Read(arrayBase + i * sizeof(uintptr_t), &ptr, sizeof(ptr)) == 0)
                 {
                     ptr = MemUtils::Normalize(ptr);
@@ -1425,7 +1515,7 @@ public:
             }
         }
 
-        dirs[0].emplace_back(MemUtils::Normalize(target), 0, 0, 1);
+        dirs[0].emplace_back(target, 0, 0, 1);
         std::sort(dirs[0].begin(), dirs[0].end(), [](const PtrDir &a, const PtrDir &b)
                   { return a.address < b.address; });
         std::println("Level 0 初始化完成，目标地址数量: {}", dirs[0].size());
@@ -1625,18 +1715,19 @@ public:
         }
     };
 
-    bool prune_dfs(const PtrDir &nodeA, const PtrDir &nodeB, int next_level, const MemoryGraph &GA, const MemoryGraph &GB, std::vector<std::vector<uint8_t>> &memo)
+    bool prune_dfs(const PtrDir &nodeA, const PtrDir &nodeB, int current_level, const MemoryGraph &GA, const MemoryGraph &GB, std::vector<std::vector<uint8_t>> &memo)
     {
-        if (next_level >= (int)GA.levels.size())
+        // 成功触底，返回 true
+        if (current_level < 0)
             return true;
 
-        const auto &layerA = GA.levels[next_level];
+        const auto &layerA = GA.levels[current_level];
         uint32_t startA = std::min((uint32_t)layerA.size(), nodeA.start);
         uint32_t endA = std::min((uint32_t)layerA.size(), nodeA.end);
         if (startA >= endA)
             return false;
 
-        const auto &layerB = (next_level < (int)GB.levels.size()) ? GB.levels[next_level] : std::vector<PtrDir>();
+        const auto &layerB = (current_level < (int)GB.levels.size()) ? GB.levels[current_level] : std::vector<PtrDir>();
         uint32_t startB = std::min((uint32_t)layerB.size(), nodeB.start);
         uint32_t endB = std::min((uint32_t)layerB.size(), nodeB.end);
 
@@ -1644,16 +1735,8 @@ public:
 
         for (uint32_t i = startA; i < endA; ++i)
         {
-            if (memo[next_level][i] == 2)
-                continue;
-            if (memo[next_level][i] == 1)
-            {
-                any_valid = true;
-                continue;
-            }
-
+            // 通过偏移量在进程 B 中计算期望的下级地址
             uint64_t expected_addr_B = nodeB.value + (layerA[i].address - nodeA.value);
-            bool found = false;
 
             if (startB < endB)
             {
@@ -1663,21 +1746,21 @@ public:
 
                 if (it != layerB.begin() + endB && it->address == expected_addr_B)
                 {
-                    if (prune_dfs(layerA[i], *it, next_level + 1, GA, GB, memo))
+                    // 找到了进程 B 中对应的子节点，进行下一步验证
+                    if (memo[current_level][i] == 1)
                     {
-                        memo[next_level][i] = 1;
                         any_valid = true;
-                        found = true;
+                    }
+                    else if (prune_dfs(layerA[i], *it, current_level - 1, GA, GB, memo))
+                    {
+                        memo[current_level][i] = 1; // 只记录成功的验证，防止假阳性污染
+                        any_valid = true;
                     }
                 }
             }
-
-            if (!found)
-                memo[next_level][i] = 2;
         }
         return any_valid;
     }
-
     void MergeBins()
     {
         std::thread([this]()
@@ -1709,7 +1792,7 @@ public:
                 std::vector<std::vector<uint8_t>> memo_roots(GA.blocks.size());
 
                 for (size_t b = 0; b < GA.blocks.size(); ++b) {
-                    memo_roots[b].resize(GA.blocks[b].roots.size(), 2);
+                    memo_roots[b].resize(GA.blocks[b].roots.size(), 0); // 默认为0即可
 
                     int match_b = -1;
                     for (size_t j = 0; j < GB.blocks.size(); ++j) {
@@ -1730,7 +1813,8 @@ public:
                             [](const PtrDir& n, uint64_t val) { return n.address < val; });
 
                         if (it != GB.blocks[match_b].roots.end() && it->address == baseB + (GA.blocks[b].roots[r].address - baseA)) {
-                            if (prune_dfs(GA.blocks[b].roots[r], *it, 0, GA, GB, memo_levels))
+                            // 修复：从 sym.level - 1 向下遍历
+                            if (prune_dfs(GA.blocks[b].roots[r], *it, GA.blocks[b].sym.level - 1, GA, GB, memo_levels))
                                 memo_roots[b][r] = 1;
                         }
                     }
@@ -1778,12 +1862,18 @@ public:
                     }
                 };
 
+                // 修复：重新连接树枝时匹配对应正确的下级 Level
                 for (auto& blk : G_next.blocks) {
-                    if (!G_next.levels.empty()) repair_links(blk.roots, memo_levels[0], new_idx[0]);
-                    else for (auto& r : blk.roots) { r.start = 0; r.end = 0; }
+                    int child_level = blk.sym.level - 1;
+                    if (child_level >= 0 && child_level < (int)memo_levels.size()) {
+                        repair_links(blk.roots, memo_levels[child_level], new_idx[child_level]);
+                    } else {
+                        for (auto& r : blk.roots) { r.start = 0; r.end = 0; }
+                    }
                 }
-                for (int L = 0; L < (int)G_next.levels.size() - 1; ++L)
-                    repair_links(G_next.levels[L], memo_levels[L + 1], new_idx[L + 1]);
+                for (int L = 1; L < (int)G_next.levels.size(); ++L) {
+                    repair_links(G_next.levels[L], memo_levels[L - 1], new_idx[L - 1]);
+                }
 
                 GA = std::move(G_next);
 
@@ -1827,9 +1917,11 @@ public:
         int offsetCount = 0;
         std::string currentBasePrefix;
 
-        std::function<void(int, const PtrDir &)> dfs = [&](int next_level, const PtrDir &node)
+        // 修复：从高层级向低层级递归
+        std::function<void(int, const PtrDir &)> dfs = [&](int current_level, const PtrDir &node)
         {
-            if (next_level >= (int)G.levels.size() || node.start >= node.end)
+            // < 0 证明我们成功触底到了 Target 级别
+            if (current_level < 0)
             {
                 fprintf(fOut, "%s", currentBasePrefix.c_str());
                 for (int i = 0; i < offsetCount; ++i)
@@ -1844,12 +1936,16 @@ public:
                 return;
             }
 
+            // 跳过半路夭折的断头链路
+            if (node.start >= node.end)
+                return;
+
             for (uint32_t i = node.start; i < node.end; ++i)
             {
                 if (offsetCount < 32)
                 {
-                    offsets[offsetCount++] = (int64_t)G.levels[next_level][i].address - (int64_t)node.value;
-                    dfs(next_level + 1, G.levels[next_level][i]);
+                    offsets[offsetCount++] = (int64_t)G.levels[current_level][i].address - (int64_t)node.value;
+                    dfs(current_level - 1, G.levels[current_level][i]); // 向下找
                     offsetCount--;
                 }
             }
@@ -1887,7 +1983,8 @@ public:
 
                 currentBasePrefix = prefixBuf;
                 offsetCount = 0;
-                dfs(0, root);
+                // 修复：传入 Root 真实的所属级别（向下找）
+                dfs(blk.sym.level - 1, root);
             }
         }
 
@@ -2276,6 +2373,23 @@ private:
         std::string valCopy(valueStr);
         double rangeMax = 0.0;
 
+        // 指针模式：强制使用 int64，值为16进制地址
+        if (mode == Types::FuzzyMode::Pointer)
+        {
+            type = Types::DataType::I64;
+            Utils::GlobalPool.push([=, this]
+                                   {
+                try {
+               
+                    uintptr_t targetAddr = std::strtoull(valCopy.c_str(), nullptr, 16);
+        
+                    targetAddr = MemUtils::Normalize(targetAddr);
+                    int64_t val = static_cast<int64_t>(targetAddr);
+                    scanner_.scan<int64_t>(pid, val, mode, isFirst, 0.0);
+                } catch (...) {} });
+            return;
+        }
+
         if (mode == Types::FuzzyMode::Range)
         {
             auto pos = valCopy.find('~');
@@ -2480,17 +2594,35 @@ private:
     void drawScanTab()
     {
         float w = ImGui::GetContentRegionAvail().x;
+        bool isPointerMode = (scanParams_.fuzzyMode == Types::FuzzyMode::Pointer);
+
         UI::Text({0.6f, 0.6f, 0.65f, 1}, "数据类型:");
-        if (ImGui::Button(Types::Labels::TYPE[static_cast<int>(scanParams_.dataType)], {w, S(45)}))
-            state_.showType = true;
+        if (isPointerMode)
+        {
+            // 指针模式下数据类型固定为 Int64，显示但禁用
+            ImGui::BeginDisabled();
+            ImGui::Button("Int64 (指针模式固定)", {w, S(45)});
+            ImGui::EndDisabled();
+        }
+        else
+        {
+            if (ImGui::Button(Types::Labels::TYPE[static_cast<int>(scanParams_.dataType)], {w, S(45)}))
+                state_.showType = true;
+        }
+
         UI::Space(S(6));
         UI::Text({0.6f, 0.6f, 0.65f, 1}, "搜索模式:");
         if (ImGui::Button(Types::Labels::FUZZY[static_cast<int>(scanParams_.fuzzyMode)], {w, S(45)}))
             state_.showMode = true;
         UI::Space(S(6));
-        UI::Text({0.6f, 0.6f, 0.65f, 1}, "搜索数值:");
-        UI::KbBtn(buf_.value, "点击输入...", {w, S(52)}, buf_.value, 63, "数值");
-        if (scanParams_.fuzzyMode == Types::FuzzyMode::Range)
+
+        UI::Text({0.6f, 0.6f, 0.65f, 1}, isPointerMode ? "目标地址(Hex):" : "搜索数值:");
+        UI::KbBtn(buf_.value, isPointerMode ? "输入Hex地址..." : "点击输入...",
+                  {w, S(52)}, buf_.value, 63, isPointerMode ? "目标地址(Hex)" : "数值");
+
+        if (isPointerMode)
+            UI::Text({0.4f, 0.8f, 1.0f, 1}, "输入16进制地址，搜索指向该地址的指针");
+        else if (scanParams_.fuzzyMode == Types::FuzzyMode::Range)
             UI::Text({0.4f, 0.8f, 1.0f, 1}, "格式: 最小值~最大值  例: 0~45  -2~2  0.1~6.5");
 
         UI::Space(S(10));
@@ -2518,7 +2650,6 @@ private:
                              : UI::Text({0.5f, 0.5f, 0.5f, 1}, "暂无结果");
         }
     }
-
     void drawResultTab()
     {
         size_t total = scanner_.count();
@@ -2654,6 +2785,8 @@ private:
     void drawCard(uintptr_t addr, float w)
     {
         bool locked = lockManager_.isLocked(addr);
+        bool isPointerMode = (scanParams_.fuzzyMode == Types::FuzzyMode::Pointer);
+
         ImGui::PushID(reinterpret_cast<void *>(addr));
         ImGui::PushStyleColor(ImGuiCol_ChildBg, locked ? ImVec4{0.2f, 0.08f, 0.08f, 1} : ImVec4{0.1f, 0.1f, 0.12f, 1});
         if (ImGui::BeginChild("Card", {w, S(85)}, true, ImGuiWindowFlags_NoScrollbar))
@@ -2663,9 +2796,20 @@ private:
             ImGui::SameLine();
             UI::Text(locked ? ImVec4{1, 0.5f, 0.5f, 1} : ImVec4{0.5f, 1, 0.5f, 1}, "%lX", addr);
             ImGui::SameLine(cw * 0.45f);
-            UI::Text({0.5f, 0.6f, 0.7f, 1}, "数值:");
-            ImGui::SameLine();
-            UI::Text({1, 1, 0.6f, 1}, "%s", MemUtils::ReadAsString(addr, scanParams_.dataType).c_str());
+
+            if (isPointerMode)
+            {
+                UI::Text({0.5f, 0.6f, 0.7f, 1}, "指向:");
+                ImGui::SameLine();
+                UI::Text({1, 1, 0.6f, 1}, "%s", MemUtils::ReadAsPointerString(addr).c_str());
+            }
+            else
+            {
+                UI::Text({0.5f, 0.6f, 0.7f, 1}, "数值:");
+                ImGui::SameLine();
+                UI::Text({1, 1, 0.6f, 1}, "%s", MemUtils::ReadAsString(addr, scanParams_.dataType).c_str());
+            }
+
             if (locked)
             {
                 ImGui::SameLine();
@@ -2676,13 +2820,16 @@ private:
             if (ImGui::Button("改", {bw, S(36)}))
             {
                 state_.modifyAddr = addr;
-                strcpy(buf_.modify, MemUtils::ReadAsString(addr, scanParams_.dataType).c_str());
+                if (isPointerMode)
+                    strcpy(buf_.modify, MemUtils::ReadAsPointerString(addr).c_str());
+                else
+                    strcpy(buf_.modify, MemUtils::ReadAsString(addr, scanParams_.dataType).c_str());
                 state_.showModify = true;
-                ImGuiFloatingKeyboard::Open(buf_.modify, 63, "新数值");
+                ImGuiFloatingKeyboard::Open(buf_.modify, 63, isPointerMode ? "新地址(Hex)" : "新数值");
             }
             ImGui::SameLine();
             if (UI::Btn(locked ? "解锁" : "锁定", {bw, S(36)}, locked ? ImVec4{0.4f, 0.15f, 0.15f, 1} : ImVec4{0.15f, 0.28f, 0.4f, 1}))
-                lockManager_.toggle(addr, scanParams_.dataType);
+                lockManager_.toggle(addr, isPointerMode ? Types::DataType::I64 : scanParams_.dataType);
             ImGui::SameLine();
             if (UI::Btn("复制", {bw, S(36)}, {0.25f, 0.35f, 0.5f, 1}))
                 copyAddress(addr);
@@ -2699,7 +2846,6 @@ private:
         ImGui::PopID();
         UI::Space(S(4));
     }
-
     void drawViewerTab()
     {
         float w = ImGui::GetContentRegionAvail().x, bh = S(42);
@@ -3319,24 +3465,23 @@ private:
         ImGui::End();
         ImGui::PopStyleColor();
     }
-
     void drawPopups(float sx, float sy, float sw, float sh)
     {
         if (state_.showScale)
         {
             drawListPopup("缩放", &state_.showScale, sx, sy, sw, sh, S(180), S(160), [&](float fw)
                           {
-                ImGui::Text("UI: %.0f%%", style_.scale * 100); ImGui::SliderFloat("##s", &style_.scale, 0.5f, 2.0f, "");
-                if (ImGui::Button("75%", {fw / 3 - S(3), S(28)})) style_.scale = 0.75f; ImGui::SameLine();
-                if (ImGui::Button("100%", {fw / 3 - S(3), S(28)})) style_.scale = 1.0f; ImGui::SameLine();
-                if (ImGui::Button("150%", {fw / 3 - S(3), S(28)})) style_.scale = 1.5f;
-                ImGui::Text("边距: %.0f", style_.margin); ImGui::SliderFloat("##m", &style_.margin, 0, 80, ""); });
+            ImGui::Text("UI: %.0f%%", style_.scale * 100); ImGui::SliderFloat("##s", &style_.scale, 0.5f, 2.0f, "");
+            if (ImGui::Button("75%", {fw / 3 - S(3), S(28)})) style_.scale = 0.75f; ImGui::SameLine();
+            if (ImGui::Button("100%", {fw / 3 - S(3), S(28)})) style_.scale = 1.0f; ImGui::SameLine();
+            if (ImGui::Button("150%", {fw / 3 - S(3), S(28)})) style_.scale = 1.5f;
+            ImGui::Text("边距: %.0f", style_.margin); ImGui::SliderFloat("##m", &style_.margin, 0, 80, ""); });
         }
         auto selector = [&](const char *title, bool *show, const char *const *items, int count, int *sel)
         {
             drawListPopup(title, show, sx, sy, sw, sh, sw * 0.75f, std::min(count * (S(42) + S(4)) + S(50), sh * 0.7f), [&](float fw)
                           {
-                for (int i = 0; i < count; ++i) if (UI::Btn(items[i], {fw, S(42)}, i == *sel ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1})) { *sel = i; *show = false; } });
+            for (int i = 0; i < count; ++i) if (UI::Btn(items[i], {fw, S(42)}, i == *sel ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1})) { *sel = i; *show = false; } });
         };
         if (state_.showType)
         {
@@ -3360,24 +3505,30 @@ private:
         {
             drawListPopup("深度", &state_.showDepth, sx, sy, sw, sh, S(160), S(320), [&](float fw)
                           {
-                for (int i = 1; i <= 20; ++i) {
-                    char lbl[8]; std::snprintf(lbl, sizeof(lbl), "%d层", i);
-                    if (UI::Btn(lbl, {fw, S(28)}, i == ptrParams_.depth ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1})) { ptrParams_.depth = i; state_.showDepth = false; }
-                } });
+            for (int i = 1; i <= 20; ++i) {
+                char lbl[8]; std::snprintf(lbl, sizeof(lbl), "%d层", i);
+                if (UI::Btn(lbl, {fw, S(28)}, i == ptrParams_.depth ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1})) { ptrParams_.depth = i; state_.showDepth = false; }
+            } });
         }
         if (state_.showOffset)
         {
             drawListPopup("偏移", &state_.showOffset, sx, sy, sw, sh, S(160), std::min(static_cast<float>(offsetLabels_.size()) * S(32) + S(40), sh * 0.6f), [&](float fw)
                           {
-                if (ImGui::BeginChild("List", {0, 0}, false)) {
-                    for (size_t i = 0; i < offsetLabels_.size(); ++i)
-                        if (UI::Btn(offsetLabels_[i].c_str(), {fw, S(28)}, static_cast<int>(i) == selectedOffsetIdx_ ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1})) { selectedOffsetIdx_ = i; state_.showOffset = false; }
-                } ImGui::EndChild(); });
+            if (ImGui::BeginChild("List", {0, 0}, false)) {
+                for (size_t i = 0; i < offsetLabels_.size(); ++i)
+                    if (UI::Btn(offsetLabels_[i].c_str(), {fw, S(28)}, static_cast<int>(i) == selectedOffsetIdx_ ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1})) { selectedOffsetIdx_ = i; state_.showOffset = false; }
+            } ImGui::EndChild(); });
         }
+        // 修改弹窗：指针模式使用Hex写入
         if (state_.showModify && !ImGuiFloatingKeyboard::IsVisible())
         {
             if (state_.modifyAddr && strlen(buf_.modify))
-                MemUtils::WriteFromString(state_.modifyAddr, scanParams_.dataType, buf_.modify);
+            {
+                if (scanParams_.fuzzyMode == Types::FuzzyMode::Pointer)
+                    MemUtils::WritePointerFromString(state_.modifyAddr, buf_.modify);
+                else
+                    MemUtils::WriteFromString(state_.modifyAddr, scanParams_.dataType, buf_.modify);
+            }
             state_.showModify = false;
             state_.modifyAddr = 0;
             buf_.modify[0] = 0;
@@ -3387,21 +3538,20 @@ private:
             static const char *bpTypeItems[] = {"读取", "写入", "读写", "执行"};
             drawListPopup("断点类型", &state_.showBpType, sx, sy, sw, sh, sw * 0.6f, S(42) * 4 + S(50), [&](float fw)
                           {
-        for (int i = 0; i < 4; ++i)
-            if (UI::Btn(bpTypeItems[i], {fw, S(42)}, i == bpParams_.bpType ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1}))
-            { bpParams_.bpType = i; state_.showBpType = false; } });
+            for (int i = 0; i < 4; ++i)
+                if (UI::Btn(bpTypeItems[i], {fw, S(42)}, i == bpParams_.bpType ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1}))
+                { bpParams_.bpType = i; state_.showBpType = false; } });
         }
         if (state_.showBpScope)
         {
             static const char *bpScopeItems[] = {"仅主线程", "仅子线程", "全部线程"};
             drawListPopup("线程范围", &state_.showBpScope, sx, sy, sw, sh, sw * 0.6f, S(42) * 3 + S(50), [&](float fw)
                           {
-        for (int i = 0; i < 3; ++i)
-            if (UI::Btn(bpScopeItems[i], {fw, S(42)}, i == bpParams_.bpScope ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1}))
-            { bpParams_.bpScope = i; state_.showBpScope = false; } });
+            for (int i = 0; i < 3; ++i)
+                if (UI::Btn(bpScopeItems[i], {fw, S(42)}, i == bpParams_.bpScope ? ImVec4{0.2f, 0.35f, 0.25f, 1} : ImVec4{0.13f, 0.13f, 0.16f, 1}))
+                { bpParams_.bpScope = i; state_.showBpScope = false; } });
         }
     }
-
     void drawTypedView(Types::ViewFormat format, uintptr_t base, std::span<const uint8_t> buffer, int rows)
     {
         ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {S(6), S(6)});
