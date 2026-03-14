@@ -341,7 +341,7 @@ public: // 外部读写接口
         return value;
     }
 
-    bool Read(uint64_t address, void *buffer, size_t size)
+    int Read(uint64_t address, void *buffer, size_t size)
     {
         return KReadProcessMemory(address, buffer, size);
     }

@@ -13,7 +13,7 @@
 #include <linux/kallsyms.h>
 
 #include "io_struct.h"
-#include "ExportFun.h"
+#include "export_fun.h"
 #include "physical.h"
 #include "hwbp.h"
 #include "virtual_input.h"

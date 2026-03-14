@@ -9,7 +9,10 @@
 #include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/uaccess.h>
 #include <asm/ptrace.h>
+#include <asm/insn.h>
+#include "emulate_insn.h"
 
 typedef struct perf_event *(*register_user_hw_breakpoint_t)(struct perf_event_attr *attr, perf_overflow_handler_t triggered, void *context, struct task_struct *tsk);
 typedef void (*unregister_hw_breakpoint_t)(struct perf_event *bp);
@@ -43,6 +46,7 @@ static inline void sample_hbp_handler(struct perf_event *bp, struct perf_sample_
     struct hwbp_record *rec = NULL;
     int i;
     uint64_t orig_addr;
+    uint64_t hit_pc;
 
     if (!info)
         return;
@@ -50,14 +54,20 @@ static inline void sample_hbp_handler(struct perf_event *bp, struct perf_sample_
     // 直接从 perf 属性中获取原始断点地址
     orig_addr = bp->attr.bp_addr;
 
+    // 保存真实触发 PC
+    hit_pc = regs->pc;
+
+    // 模拟执行触发断点的指令
+    emulate_insn(regs);
+
     spin_lock_irqsave(&hwbp_record_lock, flags);
 
     info->hit_addr = orig_addr;
 
-    // 查找当前 PC 是否记录过
+    // 查找当前 PC 是否记录过（使用 hit_pc 而非已被 emulate_insn 修改的 regs->pc）
     for (i = 0; i < info->record_count; i++)
     {
-        if (info->records[i].pc == regs->pc)
+        if (info->records[i].pc == hit_pc)
         {
             rec = &info->records[i];
             break;
@@ -68,7 +78,7 @@ static inline void sample_hbp_handler(struct perf_event *bp, struct perf_sample_
     if (!rec && info->record_count < 0x100)
     {
         rec = &info->records[info->record_count];
-        rec->pc = regs->pc;
+        rec->pc = hit_pc; // 记录真实触发 PC
         rec->hit_count = 0;
         info->record_count++;
     }
@@ -87,8 +97,7 @@ static inline void sample_hbp_handler(struct perf_event *bp, struct perf_sample_
 
     spin_unlock_irqrestore(&hwbp_record_lock, flags);
 
-    // 高频断点必须使用 ratelimited 限制打印频率，防止看门狗死机
-    pr_info_ratelimited("【命中记录】目标地址: 0x%llx, 当前PC: 0x%llx\n", orig_addr, regs->pc);
+    pr_debug("【命中记录】目标地址: 0x%llx, 当前PC: 0x%llx\n", orig_addr, hit_pc);
 }
 
 // 设置进程断点
@@ -184,7 +193,7 @@ static inline int set_process_hwbp(pid_t pid, uint64_t addr, enum bp_type type, 
 
     mutex_lock(&bp_list_mutex);
 
-    // 遍历线程组， 根据 scope 为不同线程安装断点
+    // 遍历线程组，根据 scope 为不同线程安装断点
     for_each_thread(task, t)
     {
         bool should_install = false;
