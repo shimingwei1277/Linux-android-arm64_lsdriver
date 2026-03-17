@@ -1,5 +1,3 @@
-
-
 /*
 [核心逻辑修复记录]
  内存扫描功能:
@@ -78,24 +76,8 @@
 #include "ImGuiFloatingKeyboard.h"
 #include "Disassembler.h"
 
-// ============================================================================
-// 配置模块 (Config)
-// ============================================================================
-namespace Config
+namespace Utils
 {
-    inline std::atomic<bool> g_Running{true};
-    inline std::atomic<int> g_ItemsPerPage{100};
-
-    struct Constants
-    {
-        static constexpr size_t MEM_VIEW_RANGE = 50;
-        static constexpr size_t SCAN_BUFFER = 4096;
-        static constexpr size_t BATCH_SIZE = 16384;
-        static constexpr size_t MAX_READ_GAP = 64;
-        static constexpr double FLOAT_EPSILON = 1e-4;
-        static constexpr uintptr_t ADDR_MIN = 0x10000;
-        static constexpr uintptr_t ADDR_MAX = 0x7FFFFFFFFFFF;
-    };
 
     inline unsigned GetThreadCount() noexcept
     {
@@ -104,10 +86,6 @@ namespace Config
         return 4;
     }
 
-}
-
-namespace Utils
-{
     class ThreadPool
     {
         std::vector<std::jthread> workers_;
@@ -118,7 +96,7 @@ namespace Utils
         size_t active_{0};
 
     public:
-        explicit ThreadPool(size_t n = Config::GetThreadCount())
+        explicit ThreadPool(size_t n = GetThreadCount())
         {
             if (n == 0)
                 n = 4;
@@ -192,7 +170,28 @@ namespace Utils
     };
 
     // 定义全局唯一的线程池实例
-    inline ThreadPool GlobalPool{Config::GetThreadCount()};
+    inline ThreadPool GlobalPool{GetThreadCount()};
+}
+
+// ============================================================================
+// 配置模块 (Config)
+// ============================================================================
+namespace Config
+{
+    inline std::atomic<bool> g_Running{true};
+    inline std::atomic<int> g_ItemsPerPage{100};
+
+    struct Constants
+    {
+        static constexpr size_t MEM_VIEW_RANGE = 50;
+        static constexpr size_t SCAN_BUFFER = 4096;
+        static constexpr size_t BATCH_SIZE = 16384;
+        static constexpr size_t MAX_READ_GAP = 64;
+        static constexpr double FLOAT_EPSILON = 1e-4;
+        static constexpr uintptr_t ADDR_MIN = 0x10000;
+        static constexpr uintptr_t ADDR_MAX = 0x7FFFFFFFFFFF;
+    };
+
 }
 
 // ============================================================================
@@ -200,9 +199,10 @@ namespace Utils
 // ============================================================================
 namespace Types
 {
+
     enum class DataType : uint8_t
     {
-        I8 = 0,
+        I8,
         I16,
         I32,
         I64,
@@ -210,10 +210,9 @@ namespace Types
         Double,
         Count
     };
-
     enum class FuzzyMode : uint8_t
     {
-        Unknown = 0,
+        Unknown,
         Equal,
         Greater,
         Less,
@@ -225,10 +224,9 @@ namespace Types
         Pointer,
         Count
     };
-
     enum class ViewFormat : uint8_t
     {
-        Hex = 0,
+        Hex,
         Hex64,
         I8,
         I16,
@@ -254,22 +252,24 @@ namespace Types
         constexpr std::array FORMAT = {"HexDump", "Hex64", "I8", "I16", "I32", "I64", "Float", "Double", "Disasm"};
     }
 
-    constexpr std::array<size_t, 6> DATA_SIZES = {1, 2, 4, 8, 4, 8};
-    constexpr std::array<size_t, 9> VIEW_SIZES = {1, 8, 1, 2, 4, 8, 4, 8, 4};
-
-    constexpr size_t GetDataSize(DataType type) noexcept
+    // 编译期大小查表
+    namespace detail
     {
-        auto idx = std::to_underlying(type);
-        return idx < DATA_SIZES.size() ? DATA_SIZES[idx] : 1;
+        constexpr std::array<size_t, 6> kDataSizes = {1, 2, 4, 8, 4, 8};
+        constexpr std::array<size_t, 9> kViewSizes = {1, 8, 1, 2, 4, 8, 4, 8, 4};
     }
 
-    constexpr size_t GetViewSize(ViewFormat fmt) noexcept
+    constexpr size_t GetDataSize(DataType t) noexcept
     {
-        auto idx = std::to_underlying(fmt);
-        return idx < VIEW_SIZES.size() ? VIEW_SIZES[idx] : 1;
+        auto i = std::to_underlying(t);
+        return i < detail::kDataSizes.size() ? detail::kDataSizes[i] : 1;
+    }
+    constexpr size_t GetViewSize(ViewFormat f) noexcept
+    {
+        auto i = std::to_underlying(f);
+        return i < detail::kViewSizes.size() ? detail::kViewSizes[i] : 1;
     }
 }
-
 // ============================================================================
 // 内存工具
 // ============================================================================
@@ -278,20 +278,31 @@ namespace MemUtils
     using namespace Types;
     using namespace Config;
 
-    // 去除MTE指针标签0xb40000
+    // 去除0xb40000高位标签
     constexpr uintptr_t Normalize(uintptr_t addr) noexcept
     {
         return addr & ~(0xFFULL << 56);
     }
 
-    // 验证地址合法性，指针和地址才需要验证，值不需要
+    // 验证地址合法
     constexpr bool IsValidAddr(uintptr_t addr) noexcept
     {
         uintptr_t a = Normalize(addr);
         return a > Constants::ADDR_MIN && a < Constants::ADDR_MAX;
     }
 
-    // 辅助分发
+    // 验证浮点数合法性
+    template <typename T>
+    constexpr bool IsValidFloat(T value) noexcept
+    {
+        if constexpr (std::is_floating_point_v<T>)
+        {
+            return !std::isnan(value) && !std::isinf(value) && std::fpclassify(value) != FP_SUBNORMAL;
+        }
+        return true;
+    }
+
+    // 统一的类型分发
     template <typename F>
     decltype(auto) DispatchType(DataType type, F &&fn)
     {
@@ -314,23 +325,42 @@ namespace MemUtils
         }
     }
 
-    // 读取并格式化为字符串
+    // 值的字符串转换
+    namespace detail
+    {
+        template <typename T>
+        std::string ValueToString(T val)
+        {
+            if constexpr (std::is_floating_point_v<T>)
+                return std::format("{:.11f}", val);
+            else if constexpr (sizeof(T) <= 4)
+                return std::to_string(static_cast<int>(val));
+            else
+                return std::to_string(static_cast<long long>(val));
+        }
+
+        template <typename T>
+        T StringToValue(const std::string &s)
+        {
+            if constexpr (std::is_same_v<T, float>)
+                return std::stof(s);
+            if constexpr (std::is_same_v<T, double>)
+                return std::stod(s);
+            if constexpr (sizeof(T) <= 4)
+                return static_cast<T>(std::stoi(s));
+            return static_cast<T>(std::stoll(s));
+        }
+    }
+
     inline std::string ReadAsString(uintptr_t addr, DataType type)
     {
         addr = Normalize(addr);
         if (!addr)
             return "??";
         return DispatchType(type, [&]<typename T>() -> std::string
-                            {
-        T val = dr.Read<T>(addr);
-        if constexpr (std::is_floating_point_v<T>)
-            return std::format("{:.11f}", val);
-        else if constexpr (sizeof(T) <= 4)
-            return std::to_string(static_cast<int>(val));
-        else
-            return std::to_string(static_cast<long long>(val)); });
+                            { return detail::ValueToString(dr.Read<T>(addr)); });
     }
-    // 字符串解析写入
+
     inline bool WriteFromString(uintptr_t addr, DataType type, std::string_view str)
     {
         addr = Normalize(addr);
@@ -340,15 +370,7 @@ namespace MemUtils
         {
             std::string s(str);
             return DispatchType(type, [&]<typename T>() -> bool
-                                {
-            if constexpr (std::is_same_v<T, float>)
-                return dr.Write<T>(addr, std::stof(s));
-            else if constexpr (std::is_same_v<T, double>)
-                return dr.Write<T>(addr, std::stod(s));
-            else if constexpr (sizeof(T) <= 4)
-                return dr.Write<T>(addr, static_cast<T>(std::stoi(s)));
-            else
-                return dr.Write<T>(addr, static_cast<T>(std::stoll(s))); });
+                                { return dr.Write<T>(addr, detail::StringToValue<T>(s)); });
         }
         catch (...)
         {
@@ -356,17 +378,14 @@ namespace MemUtils
         }
     }
 
-    // 指针模式下读取地址处的int64，以Hex显示
     inline std::string ReadAsPointerString(uintptr_t addr)
     {
         addr = Normalize(addr);
         if (!addr)
             return "??";
-        int64_t raw = dr.Read<int64_t>(addr);
-        uintptr_t normalized = Normalize(static_cast<uintptr_t>(raw));
-        return std::format("{:X}", normalized);
+        return std::format("{:X}", Normalize(static_cast<uintptr_t>(dr.Read<int64_t>(addr))));
     }
-    // 指针模式将Hex字符串解析为地址写入int64
+
     inline bool WritePointerFromString(uintptr_t addr, std::string_view str)
     {
         addr = Normalize(addr);
@@ -374,9 +393,8 @@ namespace MemUtils
             return false;
         try
         {
-            std::string s(str);
-            uintptr_t val = std::strtoull(s.c_str(), nullptr, 16);
-            return dr.Write<int64_t>(addr, static_cast<int64_t>(val));
+            return dr.Write<int64_t>(addr,
+                                     static_cast<int64_t>(std::strtoull(std::string(str).c_str(), nullptr, 16)));
         }
         catch (...)
         {
@@ -384,158 +402,329 @@ namespace MemUtils
         }
     }
 
+    // 统一比较
     template <typename T>
     bool Compare(T value, T target, FuzzyMode mode, double lastValue, double rangeMax = 0.0)
     {
-
-        if constexpr (std::is_integral_v<T>)
-        { // 整数使用精确比较
-            T last = static_cast<T>(lastValue);
-            switch (mode)
+        // 浮点前置检查
+        if constexpr (std::is_floating_point_v<T>)
+        {
+            if (std::isnan(value) || std::isinf(value))
+                return false;
+            // 依赖旧值的模式，旧值无效则失败
+            constexpr auto kNeedOld = [](FuzzyMode m)
             {
-            case FuzzyMode::Equal:
-                return value == target;
-            case FuzzyMode::Greater:
-                return value > target;
-            case FuzzyMode::Less:
-                return value < target;
-            case FuzzyMode::Increased:
-                return value > last;
-            case FuzzyMode::Decreased:
-                return value < last;
-            case FuzzyMode::Changed:
-                return value != last;
-            case FuzzyMode::Unchanged:
-                return value == last;
-            case FuzzyMode::Range:
+                return m == FuzzyMode::Increased || m == FuzzyMode::Decreased || m == FuzzyMode::Changed || m == FuzzyMode::Unchanged;
+            };
+            if (kNeedOld(mode) && (std::isnan(lastValue) || std::isinf(lastValue)))
+                return false;
+        }
+
+        // 辅助：获取 epsilon 和 double 转换值
+        constexpr bool isFloat = std::is_floating_point_v<T>;
+        constexpr double eps = isFloat ? Constants::FLOAT_EPSILON : 0.0;
+
+        auto eq = [&](auto a, auto b)
+        {
+            if constexpr (isFloat)
+                return std::abs(static_cast<double>(a) - static_cast<double>(b)) < eps;
+            else
+                return a == b;
+        };
+
+        T last = static_cast<T>(lastValue);
+
+        switch (mode)
+        {
+        case FuzzyMode::Equal:
+            return eq(value, target);
+        case FuzzyMode::Greater:
+            return value > target;
+        case FuzzyMode::Less:
+            return value < target;
+        case FuzzyMode::Increased:
+            return value > last;
+        case FuzzyMode::Decreased:
+            return value < last;
+        case FuzzyMode::Changed:
+            return !eq(value, last);
+        case FuzzyMode::Unchanged:
+            return eq(value, last);
+        case FuzzyMode::Range:
+        {
+            if constexpr (isFloat)
+            {
+                double lo = static_cast<double>(target), hi = rangeMax;
+                if (lo > hi)
+                    std::swap(lo, hi);
+                return static_cast<double>(value) >= lo - eps && static_cast<double>(value) <= hi + eps;
+            }
+            else
             {
                 T lo = target, hi = static_cast<T>(rangeMax);
                 if (lo > hi)
                     std::swap(lo, hi);
                 return value >= lo && value <= hi;
             }
-            case FuzzyMode::Pointer:
-            {
-                uintptr_t normalizedValue = Normalize(static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(value)));
-                uintptr_t normalizedTarget = Normalize(static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(target)));
-                return normalizedValue == normalizedTarget;
-            }
-            default:
-                return false;
-            }
         }
-        else
+        case FuzzyMode::Pointer:
         {
-            constexpr double eps = Constants::FLOAT_EPSILON;
-            double v = static_cast<double>(value);
-            double t = static_cast<double>(target);
-            switch (mode)
+            if constexpr (std::is_integral_v<T>)
             {
-            case FuzzyMode::Equal:
-                return std::abs(v - t) < eps;
-            case FuzzyMode::Greater:
-                return value > target;
-            case FuzzyMode::Less:
-                return value < target;
-            case FuzzyMode::Increased:
-                return value > static_cast<T>(lastValue);
-            case FuzzyMode::Decreased:
-                return value < static_cast<T>(lastValue);
-            case FuzzyMode::Changed:
-                return std::abs(v - lastValue) > eps;
-            case FuzzyMode::Unchanged:
-                return std::abs(v - lastValue) < eps;
-            case FuzzyMode::Range:
-            {
-                double lo = t, hi = rangeMax;
-                if (lo > hi)
-                    std::swap(lo, hi); // 自动纠正反向输入
-                return v >= lo - eps && v <= hi + eps;
+                using U = std::make_unsigned_t<T>;
+                return Normalize(static_cast<uintptr_t>(static_cast<U>(value))) == Normalize(static_cast<uintptr_t>(static_cast<U>(target)));
             }
-            case FuzzyMode::Pointer:
-                return false; // 浮点类型不支持指针模式
-            default:
-                return false;
-            }
+            return false;
+        }
+        default:
+            return false;
         }
     }
 
+    // ── HEX 偏移解析 ──
     struct OffsetParseResult
     {
         uintptr_t offset;
         bool negative;
     };
 
-    // 解析输入的HEX字符串
     inline std::optional<OffsetParseResult> ParseHexOffset(std::string_view str)
     {
         if (str.empty())
             return std::nullopt;
 
-        size_t pos = 0;
-        while (pos < str.size() && str[pos] == ' ')
-            ++pos;
-        if (pos >= str.size())
+        // 跳过前导空格
+        auto pos = str.find_first_not_of(' ');
+        if (pos == std::string_view::npos)
             return std::nullopt;
+        str.remove_prefix(pos);
 
         bool negative = false;
-        if (str[pos] == '-')
+        if (str.front() == '-')
         {
             negative = true;
-            ++pos;
+            str.remove_prefix(1);
         }
-        else if (str[pos] == '+')
+        else if (str.front() == '+')
         {
-            ++pos;
+            str.remove_prefix(1);
         }
-
-        if (pos >= str.size())
+        if (str.empty())
             return std::nullopt;
 
-        // 跳过0x前缀
-        if (pos + 1 < str.size() && str[pos] == '0' && (str[pos + 1] == 'x' || str[pos + 1] == 'X'))
-        {
-            pos += 2;
-        }
+        // 跳过 0x/0X
+        if (str.size() >= 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X'))
+            str.remove_prefix(2);
 
         uintptr_t offset = 0;
-        std::string sub(str.substr(pos));
-        if (std::sscanf(sub.c_str(), "%lx", &offset) != 1)
-        {
+        std::string buf(str);
+        if (std::sscanf(buf.c_str(), "%lx", &offset) != 1)
             return std::nullopt;
-        }
-
         return OffsetParseResult{offset, negative};
     }
-}
+
+} // namespace MemUtils
 
 // ============================================================================
-// 内存扫描
+// RAII mmap 封装
+// ============================================================================
+class MappedFile
+{
+    int fd_ = -1;
+    void *ptr_ = nullptr;
+    size_t size_ = 0;
+
+public:
+    MappedFile() = default;
+    ~MappedFile() { release(); }
+    MappedFile(const MappedFile &) = delete;
+    MappedFile &operator=(const MappedFile &) = delete;
+
+    MappedFile(MappedFile &&o) noexcept : fd_(o.fd_), ptr_(o.ptr_), size_(o.size_)
+    {
+        o.fd_ = -1;
+        o.ptr_ = nullptr;
+        o.size_ = 0;
+    }
+
+    MappedFile &operator=(MappedFile &&o) noexcept
+    {
+        if (this != &o)
+        {
+            release();
+            fd_ = o.fd_;
+            ptr_ = o.ptr_;
+            size_ = o.size_;
+            o.fd_ = -1;
+            o.ptr_ = nullptr;
+            o.size_ = 0;
+        }
+        return *this;
+    }
+
+    bool allocate(size_t sz)
+    {
+        release();
+        char tpl[] = "/data/local/tmp/memscan_XXXXXX";
+        fd_ = mkstemp(tpl);
+        if (fd_ < 0)
+            return false;
+        unlink(tpl);
+        if (ftruncate(fd_, static_cast<off_t>(sz)) != 0)
+        {
+            close(fd_);
+            fd_ = -1;
+            return false;
+        }
+        ptr_ = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (ptr_ == MAP_FAILED)
+        {
+            ptr_ = nullptr;
+            close(fd_);
+            fd_ = -1;
+            return false;
+        }
+        size_ = sz;
+        return true;
+    }
+
+    void release()
+    {
+        if (ptr_)
+        {
+            munmap(ptr_, size_);
+            ptr_ = nullptr;
+        }
+        if (fd_ >= 0)
+        {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        size_ = 0;
+    }
+
+    template <typename T = void>
+    T *as() noexcept { return static_cast<T *>(ptr_); }
+
+    template <typename T = void>
+    const T *as() const noexcept { return static_cast<const T *>(ptr_); }
+
+    size_t size() const noexcept { return size_; }
+    bool valid() const noexcept { return ptr_ != nullptr; }
+
+    void advise(int advice)
+    {
+        if (ptr_)
+            madvise(ptr_, size_, advice);
+    }
+};
+
+// ============================================================================
+// 位图包装
+// ============================================================================
+class Bitmap
+{
+    MappedFile storage_;
+    size_t totalBits_ = 0;
+
+public:
+    bool init(size_t bits, bool allSet)
+    {
+        totalBits_ = bits;
+        size_t bytes = (bits + 7) / 8;
+        if (!storage_.allocate(bytes))
+        {
+            totalBits_ = 0;
+            return false;
+        }
+
+        if (allSet)
+        {
+            std::memset(storage_.as(), 0xFF, bytes);
+            size_t tail = bits % 8;
+            if (tail)
+                storage_.as<uint8_t>()[bytes - 1] = static_cast<uint8_t>((1u << tail) - 1);
+        }
+        else
+        {
+            std::memset(storage_.as(), 0, bytes);
+        }
+        return true;
+    }
+
+    void release()
+    {
+        storage_.release();
+        totalBits_ = 0;
+    }
+
+    size_t totalBits() const noexcept { return totalBits_; }
+    size_t byteCount() const noexcept { return storage_.size(); }
+    bool valid() const noexcept { return storage_.valid(); }
+    uint8_t *data() noexcept { return storage_.as<uint8_t>(); }
+    const uint8_t *data() const noexcept { return storage_.as<const uint8_t>(); }
+
+    bool get(size_t i) const noexcept
+    {
+        return (data()[i / 8] >> (i % 8)) & 1;
+    }
+
+    void setOn(size_t i) noexcept
+    {
+        __atomic_fetch_or(&data()[i / 8],
+                          static_cast<uint8_t>(1u << (i % 8)), __ATOMIC_RELAXED);
+    }
+
+    void setOff(size_t i) noexcept
+    {
+        __atomic_fetch_and(&data()[i / 8],
+                           static_cast<uint8_t>(~(1u << (i % 8))), __ATOMIC_RELAXED);
+    }
+
+    // 快速 popcount
+    size_t popcount() const noexcept
+    {
+        size_t count = 0;
+        const uint8_t *p = data();
+        size_t bytes = byteCount();
+
+        // 按 8 字节批处理
+        size_t chunks = bytes / 8;
+        const uint64_t *p64 = reinterpret_cast<const uint64_t *>(p);
+        for (size_t i = 0; i < chunks; ++i)
+            count += __builtin_popcountll(p64[i]);
+
+        // 处理尾部
+        for (size_t i = chunks * 8; i < bytes; ++i)
+            count += __builtin_popcount(p[i]);
+
+        return count;
+    }
+};
+
+// ============================================================================
+// 内存扫描器
 // ============================================================================
 class MemScanner
 {
 public:
     using Results = std::vector<uintptr_t>;
-    using Values = std::vector<double>;
 
 private:
-    // ── Bitmap 模式数据 ──
+    // ── 区域描述 ──
     struct Region
     {
         uintptr_t start, end;
         size_t bitOffset, bitCount;
     };
+
+    // ── 核心状态 ──
+    Bitmap bitmap_;
+    MappedFile values_;
     std::vector<Region> regions_;
+    std::vector<uintptr_t> addedList_;
 
-    int bitmapFd_ = -1;
-    uint8_t *bitmapMap_ = nullptr;
-    size_t bitmapBytes_ = 0;
-    size_t totalBits_ = 0;
     size_t setBits_ = 0;
-
-    int valuesFd_ = -1;
-    double *valuesMap_ = nullptr;
-    size_t valuesCount_ = 0;
     size_t valueSize_ = 0;
 
     mutable std::shared_mutex mutex_;
@@ -543,196 +732,155 @@ private:
     std::atomic<bool> scanning_{false};
     double rangeMax_ = 0.0;
 
-    // ── mmap 辅助 ──
-    static int createTmpFd(size_t sz)
+    //  位 ↔ 地址映射
+    size_t addrToBit(uintptr_t addr) const noexcept
     {
-        char tpl[] = "/data/local/tmp/memscan_XXXXXX";
-        int fd = mkstemp(tpl);
-        if (fd < 0)
-            return -1;
-        unlink(tpl);
-        if (ftruncate(fd, static_cast<off_t>(sz)) != 0)
-        {
-            close(fd);
-            return -1;
-        }
-        return fd;
-    }
+        // 二分查找所属区域
+        auto it = std::upper_bound(regions_.begin(), regions_.end(), addr, [](uintptr_t a, const Region &r)
+                                   { return a < r.end; });
 
-    static void *mapFd(int fd, size_t sz)
-    {
-        void *p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        return p == MAP_FAILED ? nullptr : p;
-    }
-
-    void freeBitmap()
-    {
-        if (bitmapMap_)
-        {
-            munmap(bitmapMap_, bitmapBytes_);
-            bitmapMap_ = nullptr;
-        }
-        if (bitmapFd_ >= 0)
-        {
-            ::close(bitmapFd_);
-            bitmapFd_ = -1;
-        }
-        bitmapBytes_ = totalBits_ = setBits_ = 0;
-        regions_.clear();
-    }
-
-    void freeValues()
-    {
-        if (valuesMap_)
-        {
-            munmap(valuesMap_, valuesCount_ * sizeof(double));
-            valuesMap_ = nullptr;
-        }
-        if (valuesFd_ >= 0)
-        {
-            ::close(valuesFd_);
-            valuesFd_ = -1;
-        }
-        valuesCount_ = 0;
-    }
-
-    // ── Bitmap 操作 ──
-    // ── Bitmap 操作 ──
-    bool getBit(size_t i) const { return (bitmapMap_[i / 8] >> (i % 8)) & 1; }
-
-    void setBitOn(size_t i)
-    {
-        uint8_t mask = (1u << (i % 8));
-        __atomic_fetch_or(&bitmapMap_[i / 8], mask, __ATOMIC_RELAXED);
-    }
-
-    void setBitOff(size_t i)
-    {
-        uint8_t mask = ~(1u << (i % 8));
-        __atomic_fetch_and(&bitmapMap_[i / 8], mask, __ATOMIC_RELAXED);
-    }
-
-    size_t addrToBit(uintptr_t addr) const
-    {
-        size_t lo = 0, hi = regions_.size();
-        while (lo < hi)
-        {
-            size_t mid = (lo + hi) / 2;
-            if (regions_[mid].end <= addr)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        if (lo >= regions_.size() || addr < regions_[lo].start)
+        // upper_bound 找到第一个 end > addr 的区域
+        if (it == regions_.end() || addr < it->start)
             return SIZE_MAX;
 
-        size_t off = addr - regions_[lo].start;
+        size_t off = addr - it->start;
         if (off % valueSize_ != 0)
             return SIZE_MAX;
 
-        // 修复越界：防止由于计算误差导致访问到下个区块的位
         size_t index = off / valueSize_;
-        if (index >= regions_[lo].bitCount)
+        if (index >= it->bitCount)
             return SIZE_MAX;
 
-        return regions_[lo].bitOffset + index;
+        return it->bitOffset + index;
     }
 
-    uintptr_t bitToAddr(size_t globalBit) const
+    uintptr_t bitToAddr(size_t gb) const noexcept
     {
-        size_t lo = 0, hi = regions_.size();
-        while (lo < hi)
-        {
-            size_t mid = (lo + hi) / 2;
-            if (regions_[mid].bitOffset + regions_[mid].bitCount <= globalBit)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        if (lo >= regions_.size())
+        auto it = std::upper_bound(regions_.begin(), regions_.end(), gb,
+                                   [](size_t b, const Region &r)
+                                   { return b < r.bitOffset + r.bitCount; });
+        if (it == regions_.end())
             return 0;
-        return regions_[lo].start + (globalBit - regions_[lo].bitOffset) * valueSize_;
+        return it->start + (gb - it->bitOffset) * valueSize_;
     }
 
-    bool initBitmap(size_t valSz,
-                    const std::vector<std::pair<uintptr_t, uintptr_t>> &scanRegs,
-                    bool allSet)
+    // 位图初始化
+    bool initStorage(size_t valSz, const std::vector<std::pair<uintptr_t, uintptr_t>> &scanRegs, bool allSet)
     {
-        freeBitmap();
-        freeValues();
+        bitmap_.release();
+        values_.release();
+        regions_.clear();
         valueSize_ = valSz;
-        totalBits_ = 0;
+
+        size_t totalBits = 0;
         regions_.reserve(scanRegs.size());
         for (auto &[s, e] : scanRegs)
         {
             if (e - s < valSz)
                 continue;
             size_t bits = (e - s) / valSz;
-            regions_.push_back({s, e, totalBits_, bits});
-            totalBits_ += bits;
+            regions_.push_back({s, e, totalBits, bits});
+            totalBits += bits;
         }
-        if (!totalBits_)
+        if (!totalBits)
             return false;
 
-        bitmapBytes_ = (totalBits_ + 7) / 8;
-        bitmapFd_ = createTmpFd(bitmapBytes_);
-        if (bitmapFd_ < 0)
+        if (!bitmap_.init(totalBits, allSet))
             return false;
-        bitmapMap_ = static_cast<uint8_t *>(mapFd(bitmapFd_, bitmapBytes_));
-        if (!bitmapMap_)
-        {
-            ::close(bitmapFd_);
-            bitmapFd_ = -1;
-            return false;
-        }
 
-        if (allSet)
+        size_t valBytes = totalBits * sizeof(double);
+        if (!values_.allocate(valBytes))
         {
-            std::memset(bitmapMap_, 0xFF, bitmapBytes_);
-            size_t tail = totalBits_ % 8;
-            if (tail)
-                bitmapMap_[bitmapBytes_ - 1] = static_cast<uint8_t>((1u << tail) - 1);
-            setBits_ = totalBits_;
-        }
-        else
-        {
-            std::memset(bitmapMap_, 0, bitmapBytes_);
-            setBits_ = 0;
-        }
-
-        valuesCount_ = totalBits_;
-        valuesFd_ = createTmpFd(valuesCount_ * sizeof(double));
-        if (valuesFd_ < 0)
-            return false;
-        valuesMap_ = static_cast<double *>(mapFd(valuesFd_, valuesCount_ * sizeof(double)));
-        if (!valuesMap_)
-        {
-            ::close(valuesFd_);
-            valuesFd_ = -1;
+            bitmap_.release();
             return false;
         }
-        madvise(valuesMap_, valuesCount_ * sizeof(double), MADV_SEQUENTIAL);
+        values_.advise(MADV_SEQUENTIAL);
 
+        setBits_ = allSet ? totalBits : 0;
         return true;
     }
 
-    // ── 值处理辅助 ──
+    double *valuesMap() noexcept { return values_.as<double>(); }
+    const double *valuesMap() const noexcept { return values_.as<const double>(); }
+
+    // 值转 double
     template <typename T>
-    static double toDouble(T value, Types::FuzzyMode mode)
+    static double toDouble(T value, Types::FuzzyMode mode) noexcept
     {
-        if constexpr (std::is_integral_v<T>)
+        if constexpr (std::is_floating_point_v<T>)
+        {
+            double d = static_cast<double>(value);
+            return (std::isnan(d) || std::isinf(d)) ? 0.0 : d;
+        }
+        else if constexpr (std::is_integral_v<T>)
         {
             if (mode == Types::FuzzyMode::Pointer)
                 return static_cast<double>(MemUtils::Normalize(
                     static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(value))));
+            return static_cast<double>(value);
         }
         return static_cast<double>(value);
     }
 
-    // ================================================================
-    //  首扫 Unknown：bitmap全1 + 记录旧值到mmap
-    // ================================================================
+    // 并行线程分配
+    unsigned threadCount() const
+    {
+        return std::max(1u, static_cast<unsigned>(
+                                std::min(static_cast<size_t>(Utils::GetThreadCount()), regions_.size())));
+    }
 
+    //  统一的区域遍历核心
+    template <typename ProcessFn>
+    void parallelRegionScan(ProcessFn &&process)
+    {
+        unsigned tc = threadCount();
+        size_t chunk = (regions_.size() + tc - 1) / tc;
+        std::atomic<size_t> done{0};
+
+        std::vector<std::future<void>> futs;
+        futs.reserve(tc);
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t, chunk]
+                                                  {
+                size_t end = std::min(t * chunk + chunk, regions_.size());
+                std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
+
+                for (size_t ri = t * chunk; ri < end && Config::g_Running; ++ri) {
+                    auto& reg = regions_[ri];
+                    for (uintptr_t addr = reg.start; addr < reg.end;
+                         addr += Config::Constants::SCAN_BUFFER)
+                    {
+                        size_t sz = std::min(static_cast<size_t>(reg.end - addr),
+                                             Config::Constants::SCAN_BUFFER);
+                        int readBytes = dr.Read(addr, buf.data(), sz);
+                        process(reg, buf.data(), addr,
+                                readBytes > 0 ? static_cast<size_t>(readBytes) : 0, sz);
+                    }
+                    if ((done.fetch_add(1) & 0x3F) == 0)
+                        progress_ = static_cast<float>(done) / regions_.size();
+                } }));
+        }
+        for (auto &f : futs)
+            f.get();
+    }
+
+    // 清除不可读区域的位
+    template <typename T>
+    void clearUnreadableBits(const Region &reg, uintptr_t addr, size_t from, size_t to)
+    {
+        for (size_t off = from; off + sizeof(T) <= to; off += sizeof(T))
+        {
+            size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
+            if (gb < bitmap_.totalBits() && bitmap_.get(gb))
+                bitmap_.setOff(gb);
+        }
+    }
+
+    // ================================================================
+    //  首扫 Unknown — bitmap 全 1 + 记录旧值
+    // ================================================================
     template <typename T>
     void scanFirstUnknown(pid_t pid)
     {
@@ -742,86 +890,44 @@ private:
 
         {
             std::unique_lock lock(mutex_);
-            if (!initBitmap(sizeof(T), scanRegs, true))
+            if (!initStorage(sizeof(T), scanRegs, true))
                 return;
         }
 
-        unsigned tc = std::min(static_cast<size_t>(Config::GetThreadCount()), regions_.size());
-        size_t chunk = (regions_.size() + tc - 1) / tc;
-        std::atomic<size_t> done{0};
-        std::vector<std::future<void>> futs;
-        futs.reserve(tc);
-
-        for (unsigned t = 0; t < tc; ++t)
-        {
-            futs.push_back(Utils::GlobalPool.push([&, t]
-                                                  {
-                size_t end = std::min(t * chunk + chunk, regions_.size());
-                std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
-                for (size_t ri = t * chunk; ri < end && Config::g_Running; ++ri)
-                {
-                    auto& reg = regions_[ri];
-                    for (uintptr_t addr = reg.start; addr < reg.end;
-                         addr += Config::Constants::SCAN_BUFFER)
-                    {
-                        size_t sz = std::min(static_cast<size_t>(reg.end - addr),
-                                             Config::Constants::SCAN_BUFFER);
-                        int readBytes = dr.Read(addr, buf.data(), sz);
-                        if (readBytes <= 0)
-                        {
-                            for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T))
-                            {
-                                size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
-                                if (gb < totalBits_ && getBit(gb))
-                                    setBitOff(gb);
-                            }
-                            continue;
-                        }
-
-                        size_t usable = static_cast<size_t>(readBytes);
-                        for (size_t off = 0; off + sizeof(T) <= usable; off += sizeof(T))
-                        {
-                            T value;
-                            std::memcpy(&value, buf.data() + off, sizeof(T));
-                            size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
-                            valuesMap_[gb] = static_cast<double>(value);
-                        }
-                        
-                        for (size_t off = usable & ~(sizeof(T) - 1); off + sizeof(T) <= sz; off += sizeof(T))
-                        {
-                            size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
-                            if (gb < totalBits_ && getBit(gb))
-                                setBitOff(gb);
-                        }
-                    }
-                    if ((done.fetch_add(1) & 0x3F) == 0)
-                        progress_ = static_cast<float>(done) / regions_.size();
-                } }));
-        }
-        for (auto &f : futs)
-            f.get();
-
-        // 终极修复：绝对安全地统计被保留下来的 1 的数量
-        size_t actualSet = 0;
-        for (size_t i = 0; i < bitmapBytes_; ++i)
-        {
-            uint8_t byteVal = bitmapMap_[i];
-            if (byteVal)
-            {
-                // 回归本源的安全位移计算，防止任何编译器隐式越界转换
-                for (int b = 0; b < 8; ++b)
-                {
-                    if ((byteVal >> b) & 1)
-                        actualSet++;
-                }
+        parallelRegionScan([this](const Region &reg, uint8_t *buf,
+                                  uintptr_t addr, size_t readBytes, size_t sz)
+                           {
+            if (readBytes == 0) {
+                clearUnreadableBits<T>(reg, addr, 0, sz);
+                return;
             }
-        }
+
+            // 有效数据部分：记录值，过滤无效浮点
+            for (size_t off = 0; off + sizeof(T) <= readBytes; off += sizeof(T)) {
+                T value;
+                std::memcpy(&value, buf + off, sizeof(T));
+                size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
+
+                if constexpr (std::is_floating_point_v<T>) {
+                    if (!MemUtils::IsValidFloat(value)) {
+                        if (gb < bitmap_.totalBits() && bitmap_.get(gb))
+                            bitmap_.setOff(gb);
+                        continue;
+                    }
+                }
+                valuesMap()[gb] = static_cast<double>(value);
+            }
+
+            // 不完整尾部：清除位
+            size_t alignedEnd = readBytes & ~(sizeof(T) - 1);
+            clearUnreadableBits<T>(reg, addr, alignedEnd, sz); });
 
         std::unique_lock lock(mutex_);
-        setBits_ = actualSet;
+        setBits_ = bitmap_.popcount();
     }
+
     // ================================================================
-    //  首扫有目标值 (强制写入 Bitmap)
+    //  首扫有目标值
     // ================================================================
     template <typename T>
     void scanFirst(pid_t pid, T target, Types::FuzzyMode mode)
@@ -832,100 +938,37 @@ private:
 
         {
             std::unique_lock lock(mutex_);
-            if (!initBitmap(sizeof(T), scanRegs, false))
+            if (!initStorage(sizeof(T), scanRegs, false))
                 return;
         }
 
-        unsigned tc = std::min(static_cast<size_t>(Config::GetThreadCount()), scanRegs.size());
-        std::vector<std::deque<uintptr_t>> tR(tc);
-        std::vector<std::deque<double>> tV(tc);
-        std::atomic<size_t> done{0};
-        size_t chunk = (scanRegs.size() + tc - 1) / tc;
         double rmx = rangeMax_;
 
-        std::vector<std::future<void>> futs;
-        futs.reserve(tc);
-
-        for (unsigned t = 0; t < tc; ++t)
-        {
-            futs.push_back(Utils::GlobalPool.push([&, t, rmx]
-                                                  {
-                size_t end = std::min(t * chunk + chunk, scanRegs.size());
-                std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
-                for (size_t i = t * chunk; i < end && Config::g_Running; ++i)
-                {
-                    auto [rStart, rEnd] = scanRegs[i];
-                    if (rEnd - rStart < sizeof(T)) continue;
-                    for (uintptr_t addr = rStart; addr < rEnd;
-                         addr += Config::Constants::SCAN_BUFFER)
-                    {
-                        size_t sz = std::min(static_cast<size_t>(rEnd - addr),
-                                             Config::Constants::SCAN_BUFFER);
-                        
-                        int readBytes = dr.Read(addr, buf.data(), sz);
-                        if (readBytes <= 0) continue; 
-                        
-                        size_t usable = static_cast<size_t>(readBytes);
-                        for (size_t off = 0; off + sizeof(T) <= usable; off += sizeof(T))
-                        {
-                            T value;
-                            std::memcpy(&value, buf.data() + off, sizeof(T));
-                            if (MemUtils::Compare(value, target, mode, 0, rmx))
-                            {
-                                tR[t].push_back(addr + off); 
-                                tV[t].push_back(toDouble(value, mode));
-                            }
-                        }
-                    }
-                    if ((done.fetch_add(1) & 0x7F) == 0)
-                        progress_ = static_cast<float>(done) / scanRegs.size();
-                } }));
-        }
-        for (auto &f : futs)
-            f.get();
-
-        std::unique_lock lock(mutex_);
-        size_t actualSet = 0;
-        for (unsigned t = 0; t < tc; ++t)
-        {
-            for (size_t i = 0; i < tR[t].size(); ++i)
-            {
-                size_t gb = addrToBit(tR[t][i]);
-                if (gb != SIZE_MAX)
-                {
-                    setBitOn(gb);
-                    valuesMap_[gb] = tV[t][i];
-                    ++actualSet;
-                }
-            }
-        }
-        setBits_ = actualSet;
-    }
-    // ================================================================
-    //  二次扫描 Bitmap 模式
-    // ================================================================
-    template <typename T>
-    void scanNext(T target, Types::FuzzyMode mode)
-    {
-        unsigned tc = std::min(static_cast<size_t>(Config::GetThreadCount()), regions_.size());
+        // 每线程收集结果
+        unsigned tc = threadCount();
         size_t chunk = (regions_.size() + tc - 1) / tc;
-        double rmx = rangeMax_;
-
         std::atomic<size_t> done{0};
-        std::atomic<size_t> survived{0};
+
+        struct HitEntry
+        {
+            uintptr_t addr;
+            double val;
+        };
+        std::vector<std::deque<HitEntry>> threadHits(tc);
 
         std::vector<std::future<void>> futs;
         futs.reserve(tc);
 
         for (unsigned t = 0; t < tc; ++t)
         {
-            futs.push_back(Utils::GlobalPool.push([&, t, rmx]
+            futs.push_back(Utils::GlobalPool.push([&, t, rmx, chunk]
                                                   {
-                size_t end = std::min(t * chunk + chunk, regions_.size());
+                // 使用 scanRegs 而不是 regions_ 进行遍历
+                auto& myHits = threadHits[t];
                 std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
+                size_t end = std::min(t * chunk + chunk, regions_.size());
 
-                for (size_t ri = t * chunk; ri < end && Config::g_Running; ++ri)
-                {
+                for (size_t ri = t * chunk; ri < end && Config::g_Running; ++ri) {
                     auto& reg = regions_[ri];
                     for (uintptr_t addr = reg.start; addr < reg.end;
                          addr += Config::Constants::SCAN_BUFFER)
@@ -933,51 +976,98 @@ private:
                         size_t sz = std::min(static_cast<size_t>(reg.end - addr),
                                              Config::Constants::SCAN_BUFFER);
                         int readBytes = dr.Read(addr, buf.data(), sz);
-                        if (readBytes <= 0)
-                        {
-                            for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T))
-                            {
-                                size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
-                                if (gb < totalBits_ && getBit(gb))
-                                    setBitOff(gb);
-                            }
-                            continue;
-                        }
+                        if (readBytes <= 0) continue;
 
                         size_t usable = static_cast<size_t>(readBytes);
-                        for (size_t off = 0; off + sizeof(T) <= usable; off += sizeof(T))
-                        {
-                            size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
-                            if (!getBit(gb)) continue;
-
+                        for (size_t off = 0; off + sizeof(T) <= usable; off += sizeof(T)) {
                             T value;
                             std::memcpy(&value, buf.data() + off, sizeof(T));
-                            double oldVal = valuesMap_[gb];
 
-                            if (MemUtils::Compare(value, target, mode, oldVal, rmx))
-                            {
-                                valuesMap_[gb] = toDouble(value, mode);
-                                survived.fetch_add(1, std::memory_order_relaxed);
+                            if constexpr (std::is_floating_point_v<T>) {
+                                if (!MemUtils::IsValidFloat(value)) continue;
                             }
-                            else
-                            {
-                                setBitOff(gb);
+
+                            if (MemUtils::Compare(value, target, mode, 0.0, rmx)) {
+                                myHits.push_back({addr + off, toDouble(value, mode)});
                             }
-                        }
-                        
-                        for (size_t off = usable & ~(sizeof(T) - 1); off + sizeof(T) <= sz; off += sizeof(T))
-                        {
-                            size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
-                            if (gb < totalBits_ && getBit(gb))
-                                setBitOff(gb);
                         }
                     }
-                    if ((done.fetch_add(1) & 0x3F) == 0)
+                    if ((done.fetch_add(1) & 0x7F) == 0)
                         progress_ = static_cast<float>(done) / regions_.size();
                 } }));
         }
         for (auto &f : futs)
             f.get();
+
+        // 合并结果到位图
+        std::unique_lock lock(mutex_);
+        size_t actualSet = 0;
+        for (auto &hits : threadHits)
+        {
+            for (auto &[addr, val] : hits)
+            {
+                size_t gb = addrToBit(addr);
+                if (gb != SIZE_MAX)
+                {
+                    bitmap_.setOn(gb);
+                    valuesMap()[gb] = val;
+                    ++actualSet;
+                }
+            }
+        }
+        setBits_ = actualSet;
+    }
+
+    // ================================================================
+    //  二次扫描
+    // ================================================================
+    template <typename T>
+    void scanNext(T target, Types::FuzzyMode mode)
+    {
+        double rmx = rangeMax_;
+        std::atomic<size_t> survived{0};
+
+        parallelRegionScan([&, rmx](const Region &reg, uint8_t *buf,
+                                    uintptr_t addr, size_t readBytes, size_t sz)
+                           {
+            if (readBytes == 0) {
+                clearUnreadableBits<T>(reg, addr, 0, sz);
+                return;
+            }
+
+            // 有效数据部分
+            for (size_t off = 0; off + sizeof(T) <= readBytes; off += sizeof(T)) {
+                size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
+                if (!bitmap_.get(gb)) continue;
+
+                T value;
+                std::memcpy(&value, buf + off, sizeof(T));
+
+                // 浮点值/旧值有效性检查
+                if constexpr (std::is_floating_point_v<T>) {
+                    if (!MemUtils::IsValidFloat(value)) {
+                        bitmap_.setOff(gb);
+                        continue;
+                    }
+                    double oldVal = valuesMap()[gb];
+                    if (std::isnan(oldVal) || std::isinf(oldVal)) {
+                        bitmap_.setOff(gb);
+                        continue;
+                    }
+                }
+
+                double oldVal = valuesMap()[gb];
+                if (MemUtils::Compare(value, target, mode, oldVal, rmx)) {
+                    valuesMap()[gb] = toDouble(value, mode);
+                    survived.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    bitmap_.setOff(gb);
+                }
+            }
+
+            // 不完整尾部
+            size_t alignedEnd = readBytes & ~(sizeof(T) - 1);
+            clearUnreadableBits<T>(reg, addr, alignedEnd, sz); });
 
         std::unique_lock lock(mutex_);
         setBits_ = survived.load();
@@ -985,11 +1075,7 @@ private:
 
 public:
     MemScanner() = default;
-    ~MemScanner()
-    {
-        freeBitmap();
-        freeValues();
-    }
+    ~MemScanner() = default; // RAII handles cleanup
     MemScanner(const MemScanner &) = delete;
     MemScanner &operator=(const MemScanner &) = delete;
 
@@ -999,66 +1085,87 @@ public:
     size_t count() const
     {
         std::shared_lock lock(mutex_);
-        return setBits_;
+        return setBits_ + addedList_.size();
     }
 
+    // 结果分页获取
     Results getPage(size_t start, size_t cnt) const
     {
         std::shared_lock lock(mutex_);
-        if (!bitmapMap_ || setBits_ == 0 || start >= setBits_)
+        if (setBits_ == 0 && addedList_.empty())
             return {};
 
         Results r;
         r.reserve(cnt);
-        size_t found = 0, skipped = 0;
+        size_t skipped = 0;
 
-        for (auto &reg : regions_)
+        // 手动添加列表
+        for (size_t i = 0; i < addedList_.size() && r.size() < cnt; ++i)
         {
-            if (found >= cnt)
-                break;
-            size_t byteS = reg.bitOffset / 8;
-            size_t byteE = (reg.bitOffset + reg.bitCount + 7) / 8;
+            if (skipped++ < start)
+                continue;
+            r.push_back(addedList_[i]);
+        }
 
-            for (size_t b = byteS; b < byteE && found < cnt; ++b)
+        // 位图结果
+        if (r.size() < cnt && bitmap_.valid() && setBits_ > 0)
+        {
+            for (const auto &reg : regions_)
             {
-                uint8_t byte = bitmapMap_[b];
-                if (!byte)
-                    continue;
-                for (int bit = 0; bit < 8 && found < cnt; ++bit)
+                if (r.size() >= cnt)
+                    break;
+                size_t byteS = reg.bitOffset / 8;
+                size_t byteE = (reg.bitOffset + reg.bitCount + 7) / 8;
+
+                for (size_t b = byteS; b < byteE && r.size() < cnt; ++b)
                 {
-                    if (!(byte & (1 << bit)))
-                        continue;
-                    size_t gb = b * 8 + bit;
-                    if (gb < reg.bitOffset || gb >= reg.bitOffset + reg.bitCount)
+                    uint8_t byte = bitmap_.data()[b];
+                    if (!byte)
                         continue;
 
-                    if (skipped < start)
+                    for (int bit = 0; bit < 8 && r.size() < cnt; ++bit)
                     {
-                        ++skipped;
-                        continue;
+                        if (!(byte & (1 << bit)))
+                            continue;
+                        size_t gb = b * 8 + bit;
+                        if (gb < reg.bitOffset || gb >= reg.bitOffset + reg.bitCount)
+                            continue;
+                        if (skipped++ < start)
+                            continue;
+                        r.push_back(bitToAddr(gb));
                     }
-                    r.push_back(bitToAddr(gb));
-                    ++found;
                 }
             }
         }
         return r;
     }
 
+    // 清除
     void clear()
     {
         std::unique_lock lock(mutex_);
-        freeBitmap();
-        freeValues();
+        bitmap_.release();
+        values_.release();
+        regions_.clear();
+        addedList_.clear();
+        setBits_ = 0;
     }
 
+    // 单项操作
     void remove(uintptr_t addr)
     {
         std::unique_lock lock(mutex_);
-        size_t gb = addrToBit(addr);
-        if (gb != SIZE_MAX && getBit(gb))
+        auto it = std::find(addedList_.begin(), addedList_.end(), addr);
+        if (it != addedList_.end())
         {
-            setBitOff(gb);
+            addedList_.erase(it);
+            return;
+        }
+
+        size_t gb = addrToBit(addr);
+        if (gb != SIZE_MAX && bitmap_.get(gb))
+        {
+            bitmap_.setOff(gb);
             --setBits_;
         }
     }
@@ -1067,73 +1174,90 @@ public:
     {
         std::unique_lock lock(mutex_);
         size_t gb = addrToBit(addr);
-        if (gb != SIZE_MAX && !getBit(gb))
+        if (gb != SIZE_MAX)
         {
-            setBitOn(gb);
-            ++setBits_;
+            if (!bitmap_.get(gb))
+            {
+                bitmap_.setOn(gb);
+                ++setBits_;
+            }
+        }
+        else
+        {
+            if (std::find(addedList_.begin(), addedList_.end(), addr) == addedList_.end())
+                addedList_.push_back(addr);
         }
     }
 
+    //  偏移应用
     void applyOffset(int64_t offset)
     {
         std::unique_lock lock(mutex_);
-        if (!bitmapMap_ || setBits_ == 0)
+
+        auto applyOff = [offset](uintptr_t addr) -> uintptr_t
+        {
+            return offset > 0
+                       ? addr + static_cast<uintptr_t>(offset)
+                       : addr - static_cast<uintptr_t>(-offset);
+        };
+
+        // 手动列表
+        for (auto &addr : addedList_)
+            addr = applyOff(addr);
+
+        // 位图
+        if (!bitmap_.valid() || setBits_ == 0)
             return;
 
-        // 1. 提取当前 Bitmap 内仍然有效的地址及旧值
         std::vector<std::pair<uintptr_t, double>> temp;
         temp.reserve(setBits_);
-        for (auto &reg : regions_)
+
+        for (const auto &reg : regions_)
         {
             size_t byteS = reg.bitOffset / 8;
             size_t byteE = (reg.bitOffset + reg.bitCount + 7) / 8;
             for (size_t b = byteS; b < byteE; ++b)
             {
-                uint8_t byte = bitmapMap_[b];
+                uint8_t byte = bitmap_.data()[b];
                 if (!byte)
                     continue;
                 for (int bit = 0; bit < 8; ++bit)
                 {
-                    if (byte & (1 << bit))
-                    {
-                        size_t gb = b * 8 + bit;
-                        if (gb >= reg.bitOffset && gb < reg.bitOffset + reg.bitCount)
-                        {
-                            uintptr_t oldAddr = bitToAddr(gb);
-                            uintptr_t newAddr = offset > 0 ? oldAddr + static_cast<uintptr_t>(offset)
-                                                           : oldAddr - static_cast<uintptr_t>(-offset);
-                            temp.push_back({newAddr, valuesMap_[gb]});
-                        }
-                    }
+                    if (!(byte & (1 << bit)))
+                        continue;
+                    size_t gb = b * 8 + bit;
+                    if (gb >= reg.bitOffset && gb < reg.bitOffset + reg.bitCount)
+                        temp.push_back({applyOff(bitToAddr(gb)), valuesMap()[gb]});
                 }
             }
         }
 
-        // 2. 根据新内存布局重建纯净的 Bitmap
         auto scanRegs = dr.GetScanRegions();
-        if (!initBitmap(valueSize_, scanRegs, false))
+        if (!initStorage(valueSize_, scanRegs, false))
             return;
 
-        // 3. 将偏移后的结果映射回新的 Bitmap 中
         size_t actualSet = 0;
         for (const auto &[addr, val] : temp)
         {
             size_t gb = addrToBit(addr);
             if (gb != SIZE_MAX)
             {
-                setBitOn(gb);
-                valuesMap_[gb] = val;
-                actualSet++;
+                bitmap_.setOn(gb);
+                valuesMap()[gb] = val;
+                ++actualSet;
             }
         }
         setBits_ = actualSet;
     }
 
+    // 扫描入口
     template <typename T>
     void scan(pid_t pid, T target, Types::FuzzyMode mode, bool isFirst, double rangeMax = 0.0)
     {
         if (scanning_.exchange(true))
             return;
+
+        // RAII guard 确保状态恢复
         struct Guard
         {
             std::atomic<bool> &s;
@@ -2516,7 +2640,7 @@ public:
     void open(uintptr_t addr)
     {
         if (format_ == Types::ViewFormat::Disasm)
-            addr &= ~static_cast<uintptr_t>(3);
+            addr &= ~static_cast<uintptr_t>(3); // 强制 4 字节对齐
         base_ = addr;
         disasmScrollIdx_ = 0;
         refresh();
@@ -2560,7 +2684,10 @@ public:
             disasmCache_.clear();
             disasmScrollIdx_ = 0;
             if (disasm_.IsValid() && !buffer_.empty())
-                disasmCache_ = disasm_.Disassemble(base_, buffer_.data(), buffer_.size(), 0);
+            {
+                // 安全限制：哪怕 buffer_ 特别大，最多只让 Capstone 一次解 500 条指令
+                disasmCache_ = disasm_.Disassemble(base_, buffer_.data(), buffer_.size(), 500);
+            }
         }
     }
 
@@ -2579,31 +2706,29 @@ private:
         if (lines == 0)
             return;
 
-        if (disasmCache_.empty())
-        {
-            if (lines > 0)
-                base_ += lines * 4;
-            else
-                base_ = (base_ > static_cast<size_t>(-lines) * 4) ? (base_ - static_cast<size_t>(-lines) * 4) : 0;
-            base_ &= ~static_cast<uintptr_t>(3);
-            disasmScrollIdx_ = 0;
-            refresh();
-            return;
-        }
-
         int newIdx = disasmScrollIdx_ + lines;
-        static constexpr int MARGIN = 50;
 
-        if (newIdx < 0)
+        int margin = std::min(50, static_cast<int>(disasmCache_.size() / 4));
+        if (margin < 0)
+            margin = 0;
+
+        if (disasmCache_.empty() || newIdx < 0 || newIdx + margin >= static_cast<int>(disasmCache_.size()))
         {
-            base_ = (base_ > static_cast<size_t>(-newIdx) * 4) ? (base_ - static_cast<size_t>(-newIdx) * 4) : 0;
+            // ARM64 中，1 行指令 = 4 字节
+            int64_t deltaBytes = static_cast<int64_t>(newIdx) * 4;
+
+            if (deltaBytes < 0 && base_ < static_cast<uintptr_t>(-deltaBytes))
+            {
+                base_ = 0;
+            }
+            else
+            {
+                base_ += deltaBytes;
+            }
+
+            // 强制 4 字节对齐，防止计算偏差
             base_ &= ~static_cast<uintptr_t>(3);
-            disasmScrollIdx_ = 0;
-            refresh();
-        }
-        else if (newIdx + MARGIN >= static_cast<int>(disasmCache_.size()))
-        {
-            base_ = disasmCache_[std::min(static_cast<size_t>(newIdx), disasmCache_.size() - 1)].address;
+
             disasmScrollIdx_ = 0;
             refresh();
         }
@@ -2857,6 +2982,11 @@ private:
         uintptr_t address = 0;
         int bpType = 1, bpScope = 2, lenBytes = 4;
         bool active = false;
+
+        int editingRecordIdx = -1;    // 正在编辑哪条记录
+        Driver::hwbp_record editCopy; // 副本
+        char regEditBuf[64] = {};
+        int editingField = -1; // 正在编辑哪个字段
     } bpParams_;
 
     std::vector<std::string> offsetLabels_;
@@ -3833,65 +3963,181 @@ private:
 
     void drawBpRecordDetail(const auto &rec, int r)
     {
-        // PC/LR/SP 带复制按钮
-        auto regLine = [&](const char *name, uint64_t val, const char *copyId)
+        bool isEditing = (bpParams_.editingRecordIdx == r);
+        // 编辑模式下显示副本，否则显示原始
+        const auto &show = isEditing ? bpParams_.editCopy : rec;
+
+        // 编辑/应用/取消
+        if (!isEditing)
+        {
+            if (UI::Btn("编辑寄存器", {S(120), S(32)}, {0.3f, 0.4f, 0.2f, 1}))
+                beginEditRecord(r);
+        }
+        else
+        {
+            if (UI::Btn("应用", {S(70), S(32)}, Colors::BTN_GREEN))
+                applyRecordEdits(r);
+            ImGui::SameLine();
+            if (UI::Btn("取消", {S(60), S(32)}, Colors::BTN_RED))
+            {
+                bpParams_.editingRecordIdx = -1;
+                bpParams_.editingField = -1;
+            }
+        }
+        UI::Space(S(4));
+
+        // 通用：显示一行寄存器，编辑模式下多一个"改"按钮
+        // fieldId: 0~29=X0~X29, 30=LR, 31=SP, 32=PC, 33=PSTATE, 34=ORIG_X0, 35=SYSCALLNO
+        auto regLine = [&](const char *name, uint64_t val, int fieldId, uint64_t *target)
         {
             UI::Text({0.7f, 0.85f, 1, 1}, "%s: ", name);
             ImGui::SameLine();
             UI::Text(Colors::ADDR_GREEN, "0x%llX", (unsigned long long)val);
             ImGui::SameLine();
-            char id[16];
-            snprintf(id, sizeof(id), "复制##%s", copyId);
+
+            char id[32];
+            snprintf(id, sizeof(id), "复制##%s%d", name, r);
             if (UI::Btn(id, {S(50), S(28)}, Colors::BTN_COPY))
             {
                 char tmp[32];
                 snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)val);
                 ImGui::SetClipboardText(tmp);
             }
+
+            if (isEditing)
+            {
+                ImGui::SameLine();
+                snprintf(id, sizeof(id), "改##%s%d", name, r);
+                if (UI::Btn(id, {S(40), S(28)}, {0.4f, 0.3f, 0.15f, 1}))
+                {
+                    bpParams_.editingField = fieldId;
+                    snprintf(bpParams_.regEditBuf, sizeof(bpParams_.regEditBuf),
+                             "%llX", (unsigned long long)val);
+                    char title[48];
+                    snprintf(title, sizeof(title), "修改 %s (Hex)", name);
+                    ImGuiFloatingKeyboard::Open(bpParams_.regEditBuf, 63, title);
+                }
+                // 键盘关闭，写入副本
+                if (bpParams_.editingField == fieldId && !ImGuiFloatingKeyboard::IsVisible() && bpParams_.regEditBuf[0])
+                {
+                    *target = strtoull(bpParams_.regEditBuf, nullptr, 16);
+                    bpParams_.editingField = -1;
+                    bpParams_.regEditBuf[0] = 0;
+                }
+            }
         };
-        regLine("PC", rec.pc, "pc");
-        regLine("LR", rec.lr, "lr");
-        regLine("SP", rec.sp, "sp");
+
+        regLine("PC", show.pc, 32, &bpParams_.editCopy.pc);
+        regLine("LR", show.lr, 30, &bpParams_.editCopy.lr);
+        regLine("SP", show.sp, 31, &bpParams_.editCopy.sp);
         UI::Space(S(4));
 
-        UI::Text(Colors::LABEL, "PSTATE:  0x%llX", (unsigned long long)rec.pstate);
-        UI::Text(Colors::LABEL, "SYSCALL: %llu", (unsigned long long)rec.syscallno);
-        UI::Text(Colors::LABEL, "ORIG_X0: 0x%llX", (unsigned long long)rec.orig_x0);
-        UI::Text(Colors::WARN, "命中次数: %llu", (unsigned long long)rec.hit_count);
+        // PSTATE / SYSCALL / ORIG_X0 同理
+        UI::Text(Colors::LABEL, "PSTATE:  0x%llX", (unsigned long long)show.pstate);
+        if (isEditing)
+        {
+            ImGui::SameLine();
+            if (UI::Btn("改##pst", {S(40), S(28)}, {0.4f, 0.3f, 0.15f, 1}))
+            {
+                bpParams_.editingField = 33;
+                snprintf(bpParams_.regEditBuf, sizeof(bpParams_.regEditBuf),
+                         "%llX", (unsigned long long)show.pstate);
+                ImGuiFloatingKeyboard::Open(bpParams_.regEditBuf, 63, "修改 PSTATE (Hex)");
+            }
+            if (bpParams_.editingField == 33 && !ImGuiFloatingKeyboard::IsVisible() && bpParams_.regEditBuf[0])
+            {
+                bpParams_.editCopy.pstate = strtoull(bpParams_.regEditBuf, nullptr, 16);
+                bpParams_.editingField = -1;
+                bpParams_.regEditBuf[0] = 0;
+            }
+        }
+
+        UI::Text(Colors::LABEL, "SYSCALL: %llu", (unsigned long long)show.syscallno);
+        UI::Text(Colors::LABEL, "ORIG_X0: 0x%llX", (unsigned long long)show.orig_x0);
+        UI::Text(Colors::WARN, "命中次数: %llu", (unsigned long long)show.hit_count);
         UI::Space(S(6));
 
-        // 寄存器表格
+        // ━━ 通用寄存器表格 ━━
         UI::Text(Colors::TITLE, "━━ 通用寄存器 ━━");
         UI::Space(S(4));
         char tableId[32];
         snprintf(tableId, sizeof(tableId), "Regs##%d", r);
+        int cols = isEditing ? 4 : 3;
         ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {S(4), S(4)});
-        if (ImGui::BeginTable(tableId, 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+        if (ImGui::BeginTable(tableId, cols, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
         {
             ImGui::TableSetupColumn("寄存器", ImGuiTableColumnFlags_WidthFixed, S(55));
             ImGui::TableSetupColumn("值", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("操作", ImGuiTableColumnFlags_WidthFixed, S(50));
+            ImGui::TableSetupColumn("复制", ImGuiTableColumnFlags_WidthFixed, S(50));
+            if (isEditing)
+                ImGui::TableSetupColumn("改", ImGuiTableColumnFlags_WidthFixed, S(50));
             ImGui::TableHeadersRow();
+
             for (int i = 0; i < 30; ++i)
             {
                 ImGui::TableNextRow();
                 ImGui::PushID(i);
+
                 ImGui::TableSetColumnIndex(0);
                 UI::Text({0.7f, 0.85f, 1, 1}, "X%d", i);
+
                 ImGui::TableSetColumnIndex(1);
-                UI::Text(Colors::ADDR_GREEN, "0x%llX", (unsigned long long)rec.regs[i]);
+                UI::Text(Colors::ADDR_GREEN, "0x%llX", (unsigned long long)show.regs[i]);
+
                 ImGui::TableSetColumnIndex(2);
                 if (UI::Btn("复制", {S(42), S(28)}, Colors::BTN_COPY))
                 {
                     char tmp[32];
-                    snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)rec.regs[i]);
+                    snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)show.regs[i]);
                     ImGui::SetClipboardText(tmp);
+                }
+
+                if (isEditing)
+                {
+                    ImGui::TableSetColumnIndex(3);
+                    char bid[16];
+                    snprintf(bid, sizeof(bid), "改##x%d", i);
+                    if (UI::Btn(bid, {S(42), S(28)}, {0.4f, 0.3f, 0.15f, 1}))
+                    {
+                        bpParams_.editingField = i;
+                        snprintf(bpParams_.regEditBuf, sizeof(bpParams_.regEditBuf),
+                                 "%llX", (unsigned long long)show.regs[i]);
+                        char title[32];
+                        snprintf(title, sizeof(title), "修改 X%d (Hex)", i);
+                        ImGuiFloatingKeyboard::Open(bpParams_.regEditBuf, 63, title);
+                    }
+                    if (bpParams_.editingField == i && !ImGuiFloatingKeyboard::IsVisible() && bpParams_.regEditBuf[0])
+                    {
+                        bpParams_.editCopy.regs[i] = strtoull(bpParams_.regEditBuf, nullptr, 16);
+                        bpParams_.editingField = -1;
+                        bpParams_.regEditBuf[0] = 0;
+                    }
                 }
                 ImGui::PopID();
             }
             ImGui::EndTable();
         }
         ImGui::PopStyleVar();
+    }
+
+    // 拷贝副本
+    void beginEditRecord(int idx)
+    {
+        if (idx < 0 || idx >= dr.GetHwbpInfoRef().record_count)
+            return;
+        bpParams_.editingRecordIdx = idx;
+        bpParams_.editCopy = dr.GetHwbpInfoRef().records[idx]; // 完整拷贝
+        bpParams_.editingField = -1;
+    }
+    // 写回副本
+    void applyRecordEdits(int idx)
+    {
+        if (idx < 0 || idx >= dr.GetHwbpInfoRef().record_count)
+            return;
+        bpParams_.editCopy.rw = true; // 标记为写入模式
+        const_cast<Driver::hwbp_record &>(dr.GetHwbpInfoRef().records[idx]) = bpParams_.editCopy;
+        bpParams_.editingRecordIdx = -1;
+        bpParams_.editingField = -1;
     }
 
     // ================================================================
@@ -4368,6 +4614,7 @@ int main()
 
     return 0;
 }
+
 
 struct RoundResult
 {

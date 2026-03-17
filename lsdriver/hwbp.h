@@ -45,59 +45,67 @@ static inline void sample_hbp_handler(struct perf_event *bp, struct perf_sample_
     unsigned long flags;
     struct hwbp_record *rec = NULL;
     int i;
-    uint64_t orig_addr;
-    uint64_t hit_pc;
 
     if (!info)
         return;
 
     // 直接从 perf 属性中获取原始断点地址
-    orig_addr = bp->attr.bp_addr;
-
-    // 保存真实触发 PC
-    hit_pc = regs->pc;
-
-    // 模拟执行触发断点的指令
-    emulate_insn(regs);
+    info->hit_addr = bp->attr.bp_addr;
 
     spin_lock_irqsave(&hwbp_record_lock, flags);
 
-    info->hit_addr = orig_addr;
-
-    // 查找当前 PC 是否记录过（使用 hit_pc 而非已被 emulate_insn 修改的 regs->pc）
+    // 唯一的一次查找：查找当前 PC 是否记录过
     for (i = 0; i < info->record_count; i++)
     {
-        if (info->records[i].pc == hit_pc)
+        if (info->records[i].pc == regs->pc)
         {
             rec = &info->records[i];
             break;
         }
     }
 
-    // 分配新槽位
-    if (!rec && info->record_count < 0x100)
+    if (rec && rec->rw == 1)
     {
-        rec = &info->records[info->record_count];
-        rec->pc = hit_pc; // 记录真实触发 PC
-        rec->hit_count = 0;
-        info->record_count++;
-    }
+        // 写入模式：把结构体全部数据覆盖到寄存器
+        memcpy(regs->regs, rec->regs, sizeof(u64) * 30); // X0 ~ X29
+        regs->regs[30] = rec->lr;                        // X30 / LR
+        regs->sp = rec->sp;                              // SP
+        regs->pc = rec->pc;                              // PC
+        regs->orig_x0 = rec->orig_x0;                    // orig_x0
+        regs->syscallno = rec->syscallno;                // syscallno
+        regs->pstate = rec->pstate;                      // pstate
 
-    // 更新寄存器上下文
-    if (rec)
-    {
         rec->hit_count++;
-        memcpy(rec->regs, regs->regs, sizeof(u64) * 30);
-        rec->lr = regs->regs[30];
-        rec->sp = regs->sp;
-        rec->orig_x0 = regs->orig_x0;
-        rec->syscallno = regs->syscallno;
-        rec->pstate = regs->pstate;
+    }
+    else
+    {
+        // 读取模式：不同PC,分配新槽位
+        if (!rec && info->record_count < 0x100)
+        {
+            rec = &info->records[info->record_count];
+            rec->pc = regs->pc;
+            rec->rw = 0; // 新槽位默认设置为读
+            rec->hit_count = 0;
+            info->record_count++;
+        }
+
+        // 更新寄存器上下文
+        if (rec)
+        {
+            rec->hit_count++;
+            memcpy(rec->regs, regs->regs, sizeof(u64) * 30); // X0 ~ X29
+            rec->lr = regs->regs[30];                        // X30 / LR
+            rec->sp = regs->sp;
+            rec->orig_x0 = regs->orig_x0;
+            rec->syscallno = regs->syscallno;
+            rec->pstate = regs->pstate;
+        }
     }
 
     spin_unlock_irqrestore(&hwbp_record_lock, flags);
 
-    pr_debug("【命中记录】目标地址: 0x%llx, 当前PC: 0x%llx\n", orig_addr, hit_pc);
+    // 统一在最后模拟执行指令，不管读写都能步过
+    emulate_insn(regs);
 }
 
 // 设置进程断点

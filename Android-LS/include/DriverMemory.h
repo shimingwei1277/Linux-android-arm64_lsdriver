@@ -53,6 +53,10 @@
 #include <print>
 #include <algorithm>
 #include <iterator>
+#include <string>
+#include <vector>
+#include <elf.h>
+
 #define PAGE_SIZE 4096
 // 12月2日21:36开始记录修复问题:
 /* 变量统一使用下划线命名贴近内核，只有函数命名时驼峰命名
@@ -171,6 +175,7 @@ public: // 共有结构体和锁
     // 记录单个 PC（触发指令地址）的命中状态
     struct hwbp_record
     {
+        bool rw;            // 是读取，还是写入
         uint64_t pc;        // 触发断点的汇编指令地址
         uint64_t hit_count; // 该 PC 命中的次数
         uint64_t regs[30];  // 最新的 X0 ~ X29 寄存器
@@ -179,6 +184,7 @@ public: // 共有结构体和锁
         uint64_t orig_x0;   // 原始 X0
         uint64_t syscallno; // 系统调用号
         uint64_t pstate;    // 处理器状态
+
     } __attribute__((packed));
 
     // 存储整体命中信息
@@ -638,9 +644,21 @@ public: // 外部获取内存信息
         return regions;
     }
 
-    // dump so
     bool DumpModule(std::string_view moduleName)
     {
+
+        // 判断是否是需要修正地址的动态标签
+        auto IsRelocatableDynamicTag = [](uint64_t tag) -> bool
+        {
+            return tag == DT_PLTGOT || tag == DT_HASH || tag == DT_STRTAB ||
+                   tag == DT_SYMTAB || tag == DT_RELA || tag == DT_INIT ||
+                   tag == DT_FINI || tag == DT_REL || tag == DT_JMPREL ||
+                   tag == DT_INIT_ARRAY || tag == DT_FINI_ARRAY || tag == DT_GNU_HASH ||
+                   tag == 0x6000000F /* DT_ANDROID_REL */ ||
+                   tag == 0x60000011 /* DT_ANDROID_RELA */ ||
+                   tag == 0x60000012 /* DT_ANDROID_REL_OFFSET */;
+        };
+
         if (GetMemoryInformation() != 0)
         {
             std::println(stderr, "[-] Dump: 驱动获取内存信息失败");
@@ -655,17 +673,14 @@ public: // 外部获取内存信息
             const auto &mod = info.modules[i];
             std::string_view fullPath(mod.name);
 
-            if (fullPath.length() < moduleName.length())
-                continue;
-
-            size_t pos = fullPath.length() - moduleName.length();
-            if (pos > 0 && fullPath[pos - 1] != '/')
-                continue;
-
-            if (fullPath.substr(pos) == moduleName)
+            if (fullPath.ends_with(moduleName))
             {
-                targetMod = &mod;
-                break;
+                if (fullPath.length() == moduleName.length() ||
+                    fullPath[fullPath.length() - moduleName.length() - 1] == '/')
+                {
+                    targetMod = &mod;
+                    break;
+                }
             }
         }
 
@@ -675,104 +690,200 @@ public: // 外部获取内存信息
             return false;
         }
 
-        uint64_t minStart = ~0ULL;
+        // ========================================
+        // 第一步：确定模块的内存跨度
+        // ========================================
+        uint64_t baseAddr = ~0ULL;
         uint64_t maxEnd = 0;
 
         for (int i = 0; i < targetMod->seg_count; ++i)
         {
             const auto &seg = targetMod->segs[i];
-
-            if (seg.start < minStart)
-                minStart = seg.start;
+            if (seg.start < baseAddr)
+                baseAddr = seg.start;
             if (seg.end > maxEnd)
                 maxEnd = seg.end;
         }
 
-        if (minStart >= maxEnd || minStart == ~0ULL)
+        uint64_t imageSize = maxEnd - baseAddr;
+        constexpr uint64_t MAX_DUMP_SIZE = 1024ULL * 1024 * 500; // 500MB 防御 OOM
+
+        if (baseAddr >= maxEnd || baseAddr == ~0ULL || imageSize == 0 || imageSize > MAX_DUMP_SIZE)
         {
-            std::println(stderr, "[-] Dump: 模块边界无效 ({:X} - {:X})", minStart, maxEnd);
+            std::println(stderr, "[-] Dump: 模块边界无效或跨度过大 (0x{:X} 字节)", imageSize);
             return false;
         }
 
-        std::println(stdout, "[+] 准备 Dump 模块: {}, 基址: {:X}, 结束: {:X}, 物理跨度: {:X}",
-                     moduleName, minStart, maxEnd, maxEnd - minStart);
+        std::println(stdout, "[*] 模块: {}", moduleName);
+        std::println(stdout, "[*] 基址: 0x{:X}", baseAddr);
+        std::println(stdout, "[*] 结束: 0x{:X}", maxEnd);
+        std::println(stdout, "[*] 跨度: 0x{:X} ({} MB)", imageSize, imageSize / 1024 / 1024);
 
-        mkdir("/sdcard/dump", 0777);
+        // ========================================
+        // 第二步：分配缓冲区 (默认全 0，完美兼容 BSS 和 PROT_NONE 空白页)
+        // ========================================
+        std::vector<uint8_t> image(imageSize, 0);
 
-        size_t slashPos = moduleName.find_last_of('/');
-        std::string_view baseName = (slashPos == std::string_view::npos) ? moduleName : moduleName.substr(slashPos + 1);
-        std::string outPath = "/sdcard/dump/" + std::string(baseName);
-
-        FILE *fp = fopen(outPath.c_str(), "wb");
-        if (!fp)
-        {
-            std::println(stderr, "[-] Dump: 无法创建文件 {}", outPath);
-            return false;
-        }
-
-        size_t pageSize = 0x1000;
-        std::vector<uint8_t> buffer(pageSize, 0);
-        size_t totalDumped = 0;
+        // ========================================
+        // 第三步：分层智能内存读取 (解决失败率极高的问题)
+        // ========================================
+        size_t totalRead = 0;
+        size_t failedPages = 0;
 
         for (int i = 0; i < targetMod->seg_count; ++i)
         {
             const auto &seg = targetMod->segs[i];
-
             if (seg.start >= seg.end)
                 continue;
 
-            if (seg.start >= maxEnd)
-                continue;
+            uint64_t segOffset = seg.start - baseAddr;
+            uint64_t segSize = seg.end - seg.start;
 
-            off_t fileOffset = static_cast<off_t>(seg.start - minStart);
-            fseeko(fp, fileOffset, SEEK_SET);
-
-            uint64_t actualEnd = (seg.end > maxEnd) ? maxEnd : seg.end;
-
-            for (uint64_t addr = seg.start; addr < actualEnd;)
+            // 【优化】尝试一次性读取整个内存段，大幅提高速度
+            if (KReadProcessMemory(seg.start, image.data() + segOffset, segSize) > 0)
             {
-
-                uint64_t next_page_boundary = (addr + pageSize) & ~(pageSize - 1ULL);
-                size_t toRead = next_page_boundary - addr;
-
-                if (toRead > (actualEnd - addr))
+                totalRead += segSize;
+            }
+            else
+            {
+                // 如果整段读取失败（中间有保护页或未分配页），降级为分页扫描抢救
+                for (uint64_t off = 0; off < segSize; off += PAGE_SIZE)
                 {
-                    toRead = actualEnd - addr;
+                    size_t toRead = std::min((uint64_t)PAGE_SIZE, segSize - off);
+                    if (KReadProcessMemory(seg.start + off, image.data() + segOffset + off, toRead) > 0)
+                    {
+                        totalRead += toRead;
+                    }
+                    else
+                    {
+                        failedPages++; // 读取失败的页保持为 0x00，不影响整体结构
+                    }
                 }
+            }
+        }
+        std::println(stdout, "[*] 读取完成: 成功 0x{:X} 字节, 失败 {} 页", totalRead, failedPages);
 
-                if (KReadProcessMemory(addr, buffer.data(), toRead) == 0)
+        // ========================================
+        // 第四步：高级 ELF 修复 (IDA 完美解析核心)
+        // ========================================
+        if (totalRead >= sizeof(Elf64_Ehdr))
+        {
+            Elf64_Ehdr *ehdr = reinterpret_cast<Elf64_Ehdr *>(image.data());
+
+            if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) == 0 && ehdr->e_ident[EI_CLASS] == ELFCLASS64)
+            {
+                std::println(stdout, "[*] ELF 虚拟基址: 0x0 (1:1 内存映射展开)");
+
+                // 1. 抹除无效的 Section Headers
+                ehdr->e_shoff = 0;
+                ehdr->e_shnum = 0;
+                ehdr->e_shstrndx = SHN_UNDEF;
+
+                // 【安全检查】验证 Phdr 偏移是否在安全范围内
+                if (ehdr->e_phoff + (ehdr->e_phnum * sizeof(Elf64_Phdr)) <= imageSize)
                 {
-                    fwrite(buffer.data(), 1, toRead, fp);
-                }
-                else
-                {
+                    Elf64_Phdr *phdrs = reinterpret_cast<Elf64_Phdr *>(image.data() + ehdr->e_phoff);
+                    Elf64_Phdr *dynPhdr = nullptr;
 
-                    memset(buffer.data(), 0, toRead);
-                    fwrite(buffer.data(), 1, toRead, fp);
-                }
+                    std::println(stdout, "[*] 修复 ELF Program Headers ({} 个)...", ehdr->e_phnum);
 
-                addr += toRead;
-                totalDumped += toRead;
+                    // 2. 修复 Program Headers 映射
+                    int load_idx = 1;
+                    for (int i = 0; i < ehdr->e_phnum; ++i)
+                    {
+                        Elf64_Phdr &ph = phdrs[i];
+
+                        if (ph.p_type == PT_LOAD)
+                        {
+                            uint64_t old_offset = ph.p_offset;
+                            uint64_t old_filesz = ph.p_filesz;
+
+                            // 强制 1:1 映射并展开 BSS
+                            ph.p_offset = ph.p_vaddr;
+                            ph.p_filesz = ph.p_memsz;
+
+                            std::println(stdout, "  LOAD[{}]: vaddr=0x{:X}  offset: 0x{:X} -> 0x{:X}  filesz: 0x{:X} -> 0x{:X}  memsz=0x{:X}",
+                                         load_idx++, ph.p_vaddr, old_offset, ph.p_offset, old_filesz, ph.p_filesz, ph.p_memsz);
+                        }
+                        else if (ph.p_type == PT_DYNAMIC)
+                        {
+                            dynPhdr = &ph;
+                            ph.p_offset = ph.p_vaddr;
+                            ph.p_filesz = ph.p_memsz;
+                        }
+                    }
+
+                    // 3. 修复 PT_DYNAMIC (恢复导入/导出/字符串表)
+                    if (dynPhdr && (dynPhdr->p_offset + dynPhdr->p_filesz <= imageSize))
+                    {
+                        Elf64_Dyn *dynTable = reinterpret_cast<Elf64_Dyn *>(image.data() + dynPhdr->p_offset);
+                        size_t dynCount = dynPhdr->p_filesz / sizeof(Elf64_Dyn);
+
+                        for (size_t i = 0; i < dynCount; ++i)
+                        {
+                            if (dynTable[i].d_tag == DT_NULL)
+                                break;
+
+                            // 还原被 Linker 加上基址的绝对地址指针
+                            if (IsRelocatableDynamicTag(dynTable[i].d_tag))
+                            {
+                                if (dynTable[i].d_un.d_ptr >= baseAddr && dynTable[i].d_un.d_ptr < maxEnd)
+                                {
+                                    dynTable[i].d_un.d_ptr -= baseAddr;
+                                }
+                            }
+                        }
+                        std::println(stdout, "[*] ELF 修复完成 (PT_DYNAMIC 符号表已重建)");
+                    }
+                }
+            }
+            else
+            {
+                std::println(stderr, "[-] 警告: ELF Magic 校验失败，可能是头部被反Dump抹除，保存原始数据");
             }
         }
 
+        // ========================================
+        // 第五步：写入文件
+        // ========================================
+        mkdir("/sdcard/dump", 0777); // 忽略已存在错误
+
+        size_t slashPos = moduleName.find_last_of('/');
+        std::string_view baseName = (slashPos == std::string_view::npos) ? moduleName : moduleName.substr(slashPos + 1);
+        std::string outPath = "/sdcard/dump/" + std::string(baseName) + ".dump.so";
+
+        FILE *fp = fopen(outPath.c_str(), "wb");
+        if (!fp)
+        {
+            std::println(stderr, "[-] Dump: 无法创建文件 {} (请检查读写权限)", outPath);
+            return false;
+        }
+
+        fwrite(image.data(), 1, imageSize, fp);
         fclose(fp);
-        std::println(stdout, "[+] Dump 完成! 保存路径: {} (共提取 {} 字节有效数据)", outPath, totalDumped);
+
+        std::println(stdout, "[+] ==========================================");
+        std::println(stdout, "[+] Dump 完成!");
+        std::println(stdout, "[+] 路径: {}", outPath);
+        std::println(stdout, "[+] 大小: 0x{:X} ({} MB)", imageSize, imageSize / 1024 / 1024);
+        std::println(stdout, "[+] ==========================================");
 
         return true;
     }
 
 public: // 外部硬件断点接口
-    // 间接调用引用
+    // 获取断点结构体信息
     const hwbp_info &GetHwbpInfoRef()
     {
         GetHwbpInfo();
         return req->bp_info;
     }
+    // 设置断点
     int SetProcessHwbpRef(uint64_t target_addr, bp_type bt, bp_scope bs, int len_bytes)
     {
         return SetProcessHwbp(target_addr, bt, bs, len_bytes);
     }
+    // 删除断点
     void RemoveProcessHwbpRef()
     {
         RemoveProcessHwbp();
@@ -835,8 +946,9 @@ private: // 私有实现，外部无需关系
     {
         // 让驱动切换目标
         SetGlobalPid(GetPid("system_server"));
-        KReadProcessMemory(0x0, req, 1);
-        KWriteProcessMemory(0x0, req, 1);
+        uint8_t dummy_buf = 0;
+        KReadProcessMemory(0x0, &dummy_buf, 1);
+        KWriteProcessMemory(0x0, &dummy_buf, 1);
 
         // // 内核停止运行
         // req->op = op_kexit;
@@ -1052,111 +1164,6 @@ private: // 私有实现，外部无需关系
 };
 
 Driver dr(1);
-
-#include <string>
-#include <vector>
-#include <elf.h>
-
-// 极简版内存 ELF 解析器 (支持 64 位 arm64-v8a)
-namespace ElfScanner
-{
-
-    inline uintptr_t g_baseAddr = 0; // 模块基址
-    inline uintptr_t g_strTab = 0;   // 字符串表 (String Table) 的绝对地址
-    inline uintptr_t g_symTab = 0;   // 符号表 (Symbol Table) 的绝对地址
-
-    // 初始化解析器
-    inline bool Initialize(uintptr_t moduleBase)
-    {
-        if (g_baseAddr == moduleBase && g_strTab != 0 && g_symTab != 0)
-            return true;
-
-        g_baseAddr = moduleBase;
-        if (g_baseAddr == 0)
-            return false;
-
-        // 读取 ELF 头部 (Ehdr)
-        Elf64_Ehdr ehdr;
-        if (dr.Read(g_baseAddr, &ehdr, sizeof(Elf64_Ehdr)) != 0)
-            return false;
-
-        // 验证 Magic Number (魔数)，确认它是不是一个合法的 ELF 文件 (\x7F E L F)
-        if (ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != 'E' ||
-            ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F')
-            return false;
-
-        // 遍历程序头表 (Program Headers)，寻找动态段 (PT_DYNAMIC)
-        uintptr_t dynAddr = 0;
-        for (int i = 0; i < ehdr.e_phnum; i++)
-        {
-            Elf64_Phdr phdr;
-            dr.Read(g_baseAddr + ehdr.e_phoff + (i * sizeof(Elf64_Phdr)), &phdr, sizeof(Elf64_Phdr));
-            if (phdr.p_type == PT_DYNAMIC)
-            {
-                dynAddr = g_baseAddr + phdr.p_vaddr;
-                break;
-            }
-        }
-        if (dynAddr == 0)
-            return false;
-
-        //  解析动态段数组，提取符号表 (DT_SYMTAB) 和 字符串表 (DT_STRTAB)
-        Elf64_Dyn dyn;
-        int idx = 0;
-        do
-        {
-            dr.Read(dynAddr + (idx * sizeof(Elf64_Dyn)), &dyn, sizeof(Elf64_Dyn));
-            if (dyn.d_tag == DT_STRTAB)
-                g_strTab = dyn.d_un.d_ptr; // 记录字符串表偏移
-            if (dyn.d_tag == DT_SYMTAB)
-                g_symTab = dyn.d_un.d_ptr; // 记录符号表偏移
-            idx++;
-        } while (dyn.d_tag != DT_NULL && idx < 200);
-
-        // 修正 Android Linker 的地址映射
-        if (g_strTab > 0 && g_strTab < g_baseAddr)
-            g_strTab += g_baseAddr;
-        if (g_symTab > 0 && g_symTab < g_baseAddr)
-            g_symTab += g_baseAddr;
-
-        return (g_strTab != 0 && g_symTab != 0);
-    }
-
-    // 通过符号名字寻找内存中的绝对地址
-    inline uintptr_t FindSymbol(const std::string &targetName)
-    {
-
-        if (g_strTab == 0 || g_symTab == 0)
-            return 0;
-
-        // 遍历符号表  50000 的安全上限
-        for (int i = 0; i < 50000; i++)
-        {
-            Elf64_Sym sym;
-            dr.Read(g_symTab + (i * sizeof(Elf64_Sym)), &sym, sizeof(Elf64_Sym));
-
-            if (sym.st_name == 0 && sym.st_value == 0 && sym.st_info == 0)
-            {
-                if (i > 100)
-                    break;
-                continue;
-            }
-
-            if (sym.st_name == 0 || sym.st_value == 0)
-                continue;
-
-            char symName[128] = {0};
-            dr.Read(g_strTab + sym.st_name, symName, sizeof(symName) - 1);
-
-            // 内存绝对地址返回
-            if (targetName == symName)
-            {
-                return g_baseAddr + sym.st_value;
-            }
-        }
-        return 0;
-    }
-}
 
 namespace SignatureScanner
 {

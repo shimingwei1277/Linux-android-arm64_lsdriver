@@ -15,7 +15,6 @@
 #include <linux/pid.h>
 #include <linux/sort.h>
 
-
 // 断点类型
 enum bp_type
 {
@@ -36,6 +35,7 @@ enum bp_scope
 // 记录单个 PC（触发指令地址）的命中状态
 struct hwbp_record
 {
+    bool rw;            // 是读取，还是写入
     uint64_t pc;        // 触发断点的汇编指令地址
     uint64_t hit_count; // 该 PC 命中的次数
     uint64_t regs[30];  // 最新的 X0 ~ X29 寄存器
@@ -44,6 +44,7 @@ struct hwbp_record
     uint64_t orig_x0;   // 原始 X0
     uint64_t syscallno; // 系统调用号
     uint64_t pstate;    // 处理器状态
+
 } __attribute__((packed));
 
 // 存储整体命中信息
@@ -141,6 +142,5 @@ struct req_obj
     // 触摸坐标
     int x, y;
 } __attribute__((packed));
-
 
 #endif // IO_STRUCT_H   ← 文件在这里就"结束"了
