@@ -63,9 +63,6 @@ static int DispatchThreadFunction(void *data)
 					case op_init_touch:
 						req->status = v_touch_init(&req->POSITION_X, &req->POSITION_Y);
 						break;
-					case op_del_touch:
-						v_touch_destroy();
-						break;
 					case op_brps_weps_info:
 						get_hw_breakpoint_info(&req->bp_info);
 						break;
@@ -74,9 +71,6 @@ static int DispatchThreadFunction(void *data)
 						break;
 					case op_remove_process_hwbp:
 						remove_process_hwbp();
-						break;
-					case op_exit:
-						atomic_xchg(&ProcessExit, 0); // 标记用户进程已断开
 						break;
 					case op_kexit:
 						atomic_xchg(&KThreadExit, 0); // 标记内核线程退出
@@ -211,6 +205,55 @@ static int ConnectThreadFunction(void *data)
 	return 0;
 }
 
+// do_exit 执行前的回调函数
+static int handler_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	// 调用 do_exit 的进程就是当前正在运行并准备死去的进程 (current)
+	struct task_struct *task = current;
+
+	// 只监听主线程的退出
+	if (!thread_group_leader(task))
+		return 0;
+
+	// 匹配进程名
+	// Android 中 task->comm 最长只有 15 个字符，包名极可能被截断！
+	// 比如 "com.ss.android.lark" 可能会变成 "com.ss.android."
+	// 不是Android包名程序除外
+	if (strstr(task->comm, "Lark") != NULL || strstr(task->comm, "lark") != NULL)
+	{
+
+		pr_debug("【进程监听】检测到 Lark 进程即将退出！PID: %d, 进程名(comm): %s\n", task->pid, task->comm);
+
+		// 相应处理
+		atomic_xchg(&ProcessExit, 0);	 // 标记用户进程已断开
+		read_process_memory(1, 0, 0, 0); // 主动调用一下释放缓存的mm
+		v_touch_destroy(); // 清理触摸
+	}
+
+	return 0;
+}
+static int kprobe_do_exit_init(void)
+{
+	static struct kprobe kp = {
+		.symbol_name = "do_exit",
+	};
+	int ret;
+
+	// 绑定回调函数
+	kp.pre_handler = handler_pre;
+
+	// 注册 kprobe
+	ret = register_kprobe(&kp);
+	if (ret < 0)
+	{
+		pr_err("注册 kprobe(do_exit) 失败，错误码: %d\n", ret);
+		return ret;
+	}
+
+	pr_debug("成功：Kprobe(do_exit) 已注册，开始监听 Lark 退出。\n");
+	return 0;
+}
+
 // 隐藏内核模块
 static void hide_myself(void)
 {
@@ -278,6 +321,9 @@ static int __init lsdriver_init(void)
 		return PTR_ERR(dhf);
 	}
 
+	// 注册回调
+	kprobe_do_exit_init();
+
 	// 隐藏内核线程
 	hide_kthread(chf);
 	hide_kthread(dhf);
@@ -300,7 +346,6 @@ static int __init lsdriver_init(void)
 
 	return 0;
 }
-
 static void __exit lsdriver_exit(void)
 {
 	// 模块已隐藏，此函数不会被调用

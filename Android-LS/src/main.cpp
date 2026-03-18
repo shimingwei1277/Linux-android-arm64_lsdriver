@@ -4425,57 +4425,11 @@ private:
     }
 };
 
-// 信号处理函数
-void CrashSignalHandler(int sig, siginfo_t *info, void *context)
-{
-    dr.~Driver();
-
-    // 恢复该信号的默认处理方式，防止死循环
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = SIG_DFL;
-    sigemptyset(&sa.sa_mask);
-    sigaction(sig, &sa, nullptr);
-
-    // 重新发送信号，让系统执行默认的崩溃/退出流程
-    // 否则 debuggerd 不会生成 tombstone 崩溃日志
-    raise(sig);
-}
-void RegisterCrashSignals()
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = CrashSignalHandler;
-    sigemptyset(&sa.sa_mask);
-
-    // SA_SIGINFO: 获取额外信号信息
-    // SA_ONSTACK: 避免因栈溢出导致的崩溃无法捕获
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-
-    // 注册 Android ARM64 常见的意外退出和崩溃信号
-    const int signals[] = {
-        SIGSEGV, // 段错误 (内存访问越界、野指针)
-        SIGBUS,  // 总线错误
-        SIGILL,  // 非法指令
-        SIGFPE,  // 浮点异常
-        SIGABRT, // abort() 调用或 C++ 抛出未捕获异常
-        SIGINT,  // Ctrl+C
-        SIGTERM, // kill <pid> (默认终止信号)
-        SIGQUIT  // Quit 信号
-    };
-
-    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); ++i)
-    {
-        sigaction(signals[i], &sa, nullptr);
-    }
-}
-
 // ============================================================================
 // 主函数
 // ============================================================================
 int RunMemoryTool()
 {
-    RegisterCrashSignals();
 
     if (RenderVK::init())
     {
@@ -4510,6 +4464,7 @@ int RunMemoryTool()
 
 int main()
 {
+
     std::println(stdout, "请选择启动模式：");
     std::println(stdout, "  1) 性能测试");
     std::println(stdout, "  2) 内存工具");

@@ -98,8 +98,6 @@ public:                // 外部初始化
 
     ~Driver()
     {
-        DelTouch(); // 先清理触摸
-        ExitCommunication();
     }
 
 public: // 共有结构体和锁
@@ -244,13 +242,11 @@ public: // 共有结构体和锁
         op_move,
         op_up,
         op_init_touch, // 初始化触摸
-        op_del_touch,  // 清理触摸触摸
 
         op_brps_weps_info,      // 获取执行断点数量和访问断点数量
         op_set_process_hwbp,    // 设置硬件断点
         op_remove_process_hwbp, // 删除硬件断点
 
-        op_exit, // 用户进程退出
         op_kexit // 内核线程退出
     } __attribute__((packed));
 
@@ -288,6 +284,13 @@ public:
     {
         std::scoped_lock<SpinLock> lock(m_mutex);
         req->op = op_o;
+        IoCommitAndWait();
+    }
+
+    void ExitKernel()
+    {
+        // 内核停止运行
+        req->op = op_kexit;
         IoCommitAndWait();
     }
     int GetPid(std::string_view packageName)
@@ -927,7 +930,7 @@ private: // 私有实现，外部无需关系
         req->user.store(0, std::memory_order_relaxed);
     }
 
-    // 初始化驱动连接断开
+    // 初始化驱动
     void InitCommunication()
     {
         prctl(PR_SET_NAME, "Lark", 0, 0, 0);
@@ -952,31 +955,11 @@ private: // 私有实现，外部无需关系
 
         printf("驱动已经连接\n");
     }
-    void ExitCommunication()
-    {
-        // 让驱动切换目标
-        SetGlobalPid(GetPid("system_server"));
-        uint8_t dummy_buf = 0;
-        KReadProcessMemory(0x0, &dummy_buf, 1);
-        KWriteProcessMemory(0x0, &dummy_buf, 1);
 
-        // // 内核停止运行
-        // req->op = op_kexit;
-        // IoCommitAndWait();
-
-        // 普通断开
-        req->op = op_exit;
-        IoCommitAndWait();
-    }
-    // 初始化触摸连接断开
+    // 初始化触摸
     void InitTouch()
     {
         req->op = op_init_touch;
-        IoCommitAndWait();
-    }
-    void DelTouch()
-    {
-        req->op = op_del_touch;
         IoCommitAndWait();
     }
 

@@ -104,13 +104,11 @@ enum sm_req_op
     op_move,
     op_up,
     op_init_touch, // 初始化触摸
-    op_del_touch,  // 清理触摸触摸
 
     op_brps_weps_info,      // 获取执行断点数量和访问断点数量
     op_set_process_hwbp,    // 设置硬件断点
     op_remove_process_hwbp, // 删除硬件断点
 
-    op_exit, // 用户进程退出
     op_kexit // 内核线程退出
 } __attribute__((packed));
 
