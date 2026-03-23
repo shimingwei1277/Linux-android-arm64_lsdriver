@@ -380,12 +380,12 @@ public: // 外部读写接口
     }
 
     template <typename T>
-    bool Write(uint64_t address, const T &value)
+    int Write(uint64_t address, const T &value)
     {
         return KWriteProcessMemory(address, const_cast<T *>(&value), sizeof(T));
     }
 
-    bool Write(uint64_t address, void *buffer, size_t size)
+    int Write(uint64_t address, void *buffer, size_t size)
     {
         return KWriteProcessMemory(address, buffer, size);
     }
@@ -810,7 +810,7 @@ public: // 外部获取内存信息
                         }
                     }
 
-                    // 3. 修复 PT_DYNAMIC (恢复导入/导出/字符串表)
+                    //  修复 PT_DYNAMIC (恢复导入/导出/字符串表)
                     if (dynPhdr && (dynPhdr->p_offset + dynPhdr->p_filesz <= imageSize))
                     {
                         Elf64_Dyn *dynTable = reinterpret_cast<Elf64_Dyn *>(image.data() + dynPhdr->p_offset);
@@ -840,9 +840,7 @@ public: // 外部获取内存信息
             }
         }
 
-        // ========================================
-        // 第五步：写入文件
-        // ========================================
+
         mkdir("/sdcard/dump", 0777); // 忽略已存在错误
 
         size_t slashPos = moduleName.find_last_of('/');
