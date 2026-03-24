@@ -56,6 +56,7 @@
 #include <vector>
 
 #include "DriverMemory.h"
+#include "MappedFile.h"
 #include "Android_draw/draw.h"
 #include "imgui.h"
 #include "ImGuiFloatingKeyboard.h"
@@ -113,12 +114,12 @@ namespace Types
         Unchanged,
         Range,
         Pointer,
+        String,
         Count
     };
     enum class ViewFormat : uint8_t
     {
         Hex,
-        Hex16,
         Hex64,
         I8,
         I16,
@@ -160,11 +161,11 @@ namespace Types
             "未变化",
             "范围",
             "指针",
+            "String",
         };
 
         inline constexpr std::array<const char *, static_cast<size_t>(ViewFormat::Count)> FORMAT = {
             "Hex",
-            "Hex16",
             "Hex64",
             "Int8",
             "Int16",
@@ -179,7 +180,7 @@ namespace Types
     namespace detail
     {
         constexpr std::array<size_t, 6> kDataSizes = {1, 2, 4, 8, 4, 8};
-        constexpr std::array<size_t, 10> kViewSizes = {1, 2, 8, 1, 2, 4, 8, 4, 8, 4};
+        constexpr std::array<size_t, 9> kViewSizes = {1, 8, 1, 2, 4, 8, 4, 8, 4};
     }
 
     // 根据数据类型返回对应字节数。
@@ -307,6 +308,33 @@ namespace MemUtils
     }
 
     // 读取指针值并格式化为十六进制文本。
+    inline std::string ReadAsText(uintptr_t addr, size_t maxLen = 64)
+    {
+        addr = Normalize(addr);
+        if (!addr)
+            return "??";
+
+        maxLen = std::clamp<size_t>(maxLen, 1, 256);
+        std::string value = dr.ReadString(addr, maxLen);
+        for (char &ch : value)
+        {
+            unsigned char u = static_cast<unsigned char>(ch);
+            if (u < 0x20 && ch != '\t')
+                ch = '.';
+        }
+        return value;
+    }
+
+    inline bool WriteText(uintptr_t addr, std::string_view str)
+    {
+        addr = Normalize(addr);
+        if (!addr || str.empty())
+            return false;
+
+        std::string temp(str);
+        return dr.Write(addr, temp.data(), temp.size()) > 0;
+    }
+
     inline std::string ReadAsPointerString(uintptr_t addr)
     {
         addr = Normalize(addr);
@@ -455,105 +483,6 @@ namespace MemUtils
     }
 
 } // namespace MemUtils
-
-// ============================================================================
-// RAII mmap 封装
-// ============================================================================
-class MappedFile
-{
-    int fd_ = -1;
-    void *ptr_ = nullptr;
-    size_t size_ = 0;
-
-public:
-    MappedFile() = default;
-    ~MappedFile() { release(); }
-    MappedFile(const MappedFile &) = delete;
-    MappedFile &operator=(const MappedFile &) = delete;
-
-    MappedFile(MappedFile &&o) noexcept : fd_(o.fd_), ptr_(o.ptr_), size_(o.size_)
-    {
-        o.fd_ = -1;
-        o.ptr_ = nullptr;
-        o.size_ = 0;
-    }
-
-    MappedFile &operator=(MappedFile &&o) noexcept
-    {
-        if (this != &o)
-        {
-            release();
-            fd_ = o.fd_;
-            ptr_ = o.ptr_;
-            size_ = o.size_;
-            o.fd_ = -1;
-            o.ptr_ = nullptr;
-            o.size_ = 0;
-        }
-        return *this;
-    }
-
-    // 申请并初始化底层内存映射。
-    bool allocate(size_t sz)
-    {
-        release();
-        char tpl[] = "/data/local/tmp/memscan_XXXXXX";
-        fd_ = mkstemp(tpl);
-        if (fd_ < 0)
-            return false;
-        unlink(tpl);
-        if (ftruncate(fd_, static_cast<off_t>(sz)) != 0)
-        {
-            close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        ptr_ = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-        if (ptr_ == MAP_FAILED)
-        {
-            ptr_ = nullptr;
-            close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        size_ = sz;
-        return true;
-    }
-
-    // 释放当前对象持有的底层资源。
-    void release()
-    {
-        if (ptr_)
-        {
-            munmap(ptr_, size_);
-            ptr_ = nullptr;
-        }
-        if (fd_ >= 0)
-        {
-            ::close(fd_);
-            fd_ = -1;
-        }
-        size_ = 0;
-    }
-
-    template <typename T = void>
-    T *as() noexcept { return static_cast<T *>(ptr_); }
-
-    template <typename T = void>
-    const T *as() const noexcept { return static_cast<const T *>(ptr_); }
-
-    // 返回当前映射区域的字节大小。
-    size_t size() const noexcept { return size_; }
-    // 判断当前映射指针是否有效。
-    bool valid() const noexcept { return ptr_ != nullptr; }
-
-    // 向内核提示映射区域的访问模式。
-    void advise(int advice)
-    {
-        if (ptr_)
-            madvise(ptr_, size_, advice);
-    }
-};
 
 // ============================================================================
 // 位图包装
@@ -1020,6 +949,158 @@ private:
         setBits_ = survived.load();
     }
 
+    void scanFirstString(const std::string &needle)
+    {
+        if (needle.empty())
+            return;
+
+        auto scanRegs = dr.GetScanRegions();
+        if (scanRegs.empty())
+            return;
+
+        {
+            std::unique_lock lock(mutex_);
+            bitmap_.release();
+            values_.release();
+            regions_.clear();
+            setBits_ = 0;
+            valueSize_ = 0;
+            addedList_.clear();
+        }
+
+        const size_t patLen = needle.size();
+        if (patLen > Config::Constants::SCAN_BUFFER)
+            return;
+
+        unsigned tc = std::max(1u, static_cast<unsigned>(
+                                       std::min(static_cast<size_t>(Utils::GetThreadCount()), scanRegs.size())));
+        size_t chunk = (scanRegs.size() + tc - 1) / tc;
+        std::atomic<size_t> done{0};
+
+        std::vector<std::deque<uintptr_t>> threadHits(tc);
+        std::vector<std::future<void>> futs;
+        futs.reserve(tc);
+
+        const size_t step = (Config::Constants::SCAN_BUFFER > patLen)
+                                ? (Config::Constants::SCAN_BUFFER - patLen + 1)
+                                : 1;
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t]
+                                                  {
+                auto &myHits = threadHits[t];
+                std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
+                size_t end = std::min(t * chunk + chunk, scanRegs.size());
+
+                for (size_t ri = t * chunk; ri < end && Config::g_Running; ++ri) {
+                    auto [start, finish] = scanRegs[ri];
+                    if (finish <= start || static_cast<size_t>(finish - start) < patLen)
+                    {
+                        if ((done.fetch_add(1) & 0x3F) == 0)
+                            progress_ = static_cast<float>(done) / scanRegs.size();
+                        continue;
+                    }
+
+                    for (uintptr_t addr = start; addr + patLen <= finish;) {
+                        size_t readSize = std::min(static_cast<size_t>(finish - addr), Config::Constants::SCAN_BUFFER);
+                        int readBytes = dr.Read(addr, buf.data(), readSize);
+                        if (readBytes > 0) {
+                            size_t usable = static_cast<size_t>(readBytes);
+                            if (usable >= patLen) {
+                                size_t uniqueLimit = (addr + step < finish) ? std::min(step, usable) : usable;
+                                for (size_t off = 0; off + patLen <= usable && off < uniqueLimit; ++off) {
+                                    if (std::memcmp(buf.data() + off, needle.data(), patLen) == 0)
+                                        myHits.push_back(addr + off);
+                                }
+                            }
+                        }
+
+                        if (addr + step <= addr || addr + step >= finish)
+                            break;
+                        addr += step;
+                    }
+
+                    if ((done.fetch_add(1) & 0x3F) == 0)
+                        progress_ = static_cast<float>(done) / scanRegs.size();
+                } }));
+        }
+
+        for (auto &f : futs)
+            f.get();
+
+        std::vector<uintptr_t> merged;
+        for (auto &hits : threadHits)
+        {
+            merged.insert(merged.end(), hits.begin(), hits.end());
+        }
+        std::sort(merged.begin(), merged.end());
+        merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+
+        std::unique_lock lock(mutex_);
+        addedList_.swap(merged);
+        setBits_ = 0;
+    }
+
+    void scanNextString(const std::string &needle)
+    {
+        if (needle.empty())
+            return;
+
+        std::vector<uintptr_t> current;
+        {
+            std::shared_lock lock(mutex_);
+            current = addedList_;
+        }
+        if (current.empty())
+            return;
+
+        const size_t patLen = needle.size();
+        unsigned tc = std::max(1u, static_cast<unsigned>(
+                                       std::min(static_cast<size_t>(Utils::GetThreadCount()), current.size())));
+        size_t chunk = (current.size() + tc - 1) / tc;
+        std::atomic<size_t> done{0};
+
+        std::vector<std::vector<uintptr_t>> threadHits(tc);
+        std::vector<std::future<void>> futs;
+        futs.reserve(tc);
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t]
+                                                  {
+                auto &myHits = threadHits[t];
+                std::vector<uint8_t> buf(patLen);
+                size_t end = std::min(t * chunk + chunk, current.size());
+                for (size_t i = t * chunk; i < end && Config::g_Running; ++i) {
+                    uintptr_t addr = current[i];
+                    int readBytes = dr.Read(addr, buf.data(), patLen);
+                    if (readBytes > 0 && static_cast<size_t>(readBytes) >= patLen &&
+                        std::memcmp(buf.data(), needle.data(), patLen) == 0) {
+                        myHits.push_back(addr);
+                    }
+
+                    size_t finished = done.fetch_add(1) + 1;
+                    if ((finished & 0x3FF) == 0)
+                        progress_ = static_cast<float>(finished) / current.size();
+                } }));
+        }
+        for (auto &f : futs)
+            f.get();
+
+        std::vector<uintptr_t> merged;
+        for (auto &hits : threadHits)
+        {
+            merged.insert(merged.end(), hits.begin(), hits.end());
+        }
+        std::sort(merged.begin(), merged.end());
+        merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+
+        std::unique_lock lock(mutex_);
+        addedList_.swap(merged);
+        setBits_ = 0;
+    }
+
 public:
     MemScanner() = default;
     ~MemScanner() = default; // RAII handles cleanup
@@ -1235,6 +1316,29 @@ public:
         {
             scanNext<T>(target, mode);
         }
+    }
+
+    void scanString(pid_t /*pid*/, const std::string &needle, bool isFirst)
+    {
+        if (scanning_.exchange(true))
+            return;
+
+        struct Guard
+        {
+            std::atomic<bool> &s;
+            std::atomic<float> &p;
+            ~Guard()
+            {
+                s = false;
+                p = 1.0f;
+            }
+        } guard{scanning_, progress_};
+
+        progress_ = 0.0f;
+        if (isFirst)
+            scanFirstString(needle);
+        else
+            scanNextString(needle);
     }
 };
 
@@ -2962,6 +3066,7 @@ private:
         Types::DataType dataType = Types::DataType::I32;
         Types::FuzzyMode fuzzyMode = Types::FuzzyMode::Unknown;
         int page = 0;
+        std::string lastStringPattern;
     } scanParams_;
 
     struct PtrParams
@@ -3038,6 +3143,15 @@ private:
                     auto addr = MemUtils::Normalize(std::strtoull(valCopy.c_str(), nullptr, 16));
                     scanner_.scan<int64_t>(pid, static_cast<int64_t>(addr), mode, isFirst, 0.0);
                 } catch (...) {} });
+            return;
+        }
+        if (mode == Types::FuzzyMode::String)
+        {
+            if (valCopy.empty())
+                return;
+            scanParams_.lastStringPattern = valCopy;
+            Utils::GlobalPool.push([=, this]
+                                   { scanner_.scanString(pid, valCopy, isFirst); });
             return;
         }
         if (mode == Types::FuzzyMode::Range)
@@ -3237,13 +3351,14 @@ private:
     {
         float w = ImGui::GetContentRegionAvail().x;
         bool isPtrMode = scanParams_.fuzzyMode == Types::FuzzyMode::Pointer;
+        bool isStringMode = scanParams_.fuzzyMode == Types::FuzzyMode::String;
 
         // 数据类型
         UI::Text(Colors::LABEL, "数据类型:");
-        if (isPtrMode)
+        if (isPtrMode || isStringMode)
         {
             ImGui::BeginDisabled();
-            ImGui::Button("Int64 (指针模式固定)", {w, S(45)});
+            ImGui::Button(isPtrMode ? "Int64 (pointer mode)" : "String mode ignores type", {w, S(45)});
             ImGui::EndDisabled();
         }
         else
@@ -3264,6 +3379,8 @@ private:
 
         if (isPtrMode)
             UI::Text(Colors::INFO_CYAN, "输入16进制地址，搜索指向该地址的指针");
+        else if (isStringMode)
+            UI::Text(Colors::INFO_CYAN, "按原始字节匹配，区分大小写；再次扫描会在当前结果中继续过滤");
         else if (scanParams_.fuzzyMode == Types::FuzzyMode::Range)
             UI::Text(Colors::INFO_CYAN, "格式: 最小值~最大值  例: 0~45  -2~2  0.1~6.5");
 
@@ -3400,10 +3517,17 @@ private:
 
         bool anyLocked = std::ranges::any_of(data, [&](auto a)
                                              { return lockManager_.isLocked(a); });
+        bool isStringMode = scanParams_.fuzzyMode == Types::FuzzyMode::String;
         if (anyLocked)
         {
             if (UI::Btn("解锁页", {S(70), S(36)}, {0.2f, 0.25f, 0.42f, 1}))
                 lockManager_.unlockBatch(data);
+        }
+        else if (isStringMode)
+        {
+            ImGui::BeginDisabled();
+            UI::Btn("Lock", {S(70), S(36)}, {0.2f, 0.2f, 0.2f, 1});
+            ImGui::EndDisabled();
         }
         else
         {
@@ -3429,6 +3553,8 @@ private:
     {
         bool locked = lockManager_.isLocked(addr);
         bool isPtrMode = scanParams_.fuzzyMode == Types::FuzzyMode::Pointer;
+        bool isStringMode = scanParams_.fuzzyMode == Types::FuzzyMode::String;
+        size_t previewLen = std::clamp(scanParams_.lastStringPattern.size(), size_t(16), size_t(64));
 
         ImGui::PushID((void *)addr);
         UI::ColorChild("Card", {w, S(85)}, locked ? Colors::LOCKED : Colors::BG_PANEL, [&]
@@ -3442,6 +3568,9 @@ private:
             if (isPtrMode)
                 UI::LabelValue({0.5f,0.6f,0.7f,1}, "指向:", Colors::VAL_YELLOW, "%s",
                                MemUtils::ReadAsPointerString(addr).c_str());
+            else if (isStringMode)
+                UI::LabelValue({0.5f,0.6f,0.7f,1}, "字符串:", Colors::VAL_YELLOW, "%s",
+                               MemUtils::ReadAsText(addr, previewLen).c_str());
             else
                 UI::LabelValue({0.5f,0.6f,0.7f,1}, "数值:", Colors::VAL_YELLOW, "%s",
                                MemUtils::ReadAsString(addr, scanParams_.dataType).c_str());
@@ -3452,15 +3581,20 @@ private:
             float bw = (cw - S(15)) / 4;
             if (ImGui::Button("改", {bw, S(36)})) {
                 state_.modifyAddr = addr;
-                strcpy(buf_.modify, isPtrMode ? MemUtils::ReadAsPointerString(addr).c_str()
-                                              : MemUtils::ReadAsString(addr, scanParams_.dataType).c_str());
+                std::string current = isPtrMode ? MemUtils::ReadAsPointerString(addr)
+                                                : isStringMode ? MemUtils::ReadAsText(addr, previewLen)
+                                                               : MemUtils::ReadAsString(addr, scanParams_.dataType);
+                std::snprintf(buf_.modify, sizeof(buf_.modify), "%s", current.c_str());
                 state_.showModify = true;
-                ImGuiFloatingKeyboard::Open(buf_.modify, 63, isPtrMode ? "新地址(Hex)" : "新数值");
+                ImGuiFloatingKeyboard::Open(buf_.modify, 63, isPtrMode ? "新地址(Hex)"
+                                                                        : isStringMode ? "新字符串"
+                                                                                       : "新数值");
             }
             ImGui::SameLine();
             if (UI::Btn(locked ? "解锁" : "锁定", {bw, S(36)},
                         locked ? Colors::BTN_UNLOCK : Colors::BTN_LOCK))
-                lockManager_.toggle(addr, isPtrMode ? Types::DataType::I64 : scanParams_.dataType);
+                if (!(isStringMode && !locked))
+                    lockManager_.toggle(addr, isPtrMode ? Types::DataType::I64 : scanParams_.dataType);
             ImGui::SameLine();
             if (UI::Btn("复制", {bw, S(36)}, Colors::BTN_COPY)) copyAddress(addr);
             ImGui::SameLine();
@@ -4237,6 +4371,8 @@ private:
             {
                 if (scanParams_.fuzzyMode == Types::FuzzyMode::Pointer)
                     MemUtils::WritePointerFromString(state_.modifyAddr, buf_.modify);
+                else if (scanParams_.fuzzyMode == Types::FuzzyMode::String)
+                    MemUtils::WriteText(state_.modifyAddr, buf_.modify);
                 else
                     MemUtils::WriteFromString(state_.modifyAddr, scanParams_.dataType, buf_.modify);
             }
