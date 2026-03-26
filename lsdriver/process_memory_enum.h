@@ -361,7 +361,7 @@ static inline int enum_process_memory(pid_t pid, struct memory_info *info)
      *     index=1(Header/RELRO) → prot=1(R)
      *     index=0(Code)         → prot=5(RX)
      *     index=2(Data)         → prot=3(RW)
-     *     index=-1(BSS)         → prot=3(RW)  (同时修正 -w- 的异常权限)
+     *     index=-1(BSS)         → prot=3(RW)  
      *   彻底断绝 prot 污染，使对外输出的 prot 与原生 ELF 加载完全一致。
      *
      *   步骤 5：拉链式精准缝合 (还原原生边界)
